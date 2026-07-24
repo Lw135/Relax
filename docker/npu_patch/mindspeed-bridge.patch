@@ -31,6 +31,59 @@ index 818af29..ef97078 100644
              self.gated_delta_rule = chunk_gated_delta_rule
          elif self.use_ascend_gdn:
              self.gated_delta_rule = flash_gated_delta_rule
+diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+index 529eaa3..1df512c 100644
+--- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
++++ b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/text_model.py
+@@ -108,6 +108,7 @@ class Qwen3VLGPTModel(GPTModel):
+         # args for deepstack
+         visual_pos_masks: Optional[torch.Tensor] = None,
+         deepstack_visual_embeds: Optional[list[torch.Tensor]] = None,
++        mtp_kwargs: Optional[dict] = None,
+     ) -> Tensor:
+         """Forward function of the GPT Model This function passes the input tensors
+         through the embedding layer, and then the decoeder and finally into the post
+@@ -195,6 +196,7 @@ class Qwen3VLGPTModel(GPTModel):
+             runtime_gather_output=runtime_gather_output,
+             extra_block_kwargs=extra_block_kwargs,
+             inference_context=inference_context,
++            mtp_kwargs=mtp_kwargs,
+         )
+ 
+         if _shadow_embedding:
+diff --git a/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py b/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py
+index 1ba94f1..9f1bfb8 100644
+--- a/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py
++++ b/mindspeed_bridge/models/qwen_vl/qwen35_vl_bridge.py
+@@ -795,6 +795,8 @@ class Qwen35VLBridge(MegatronModelBridge):
+                     f"language_model.mtp.layers.{mtp_layer}.final_layernorm.weight": "mtp.norm.weight",
+                     f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.router.weight": f"mtp.layers.{mtp_layer}.mlp.gate.weight",
+                     f"language_model.mtp.layers.{mtp_layer}.transformer_layer.pre_mlp_layernorm.weight": f"mtp.layers.{mtp_layer}.post_attention_layernorm.weight",
++                    # Dense MLP pre-MLP layernorm (fused inside the MLP column parallel linear)
++                    f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.linear_fc1.layer_norm_weight": f"mtp.layers.{mtp_layer}.post_attention_layernorm.weight",
+                     f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.linear_qkv.layer_norm_weight": f"mtp.layers.{mtp_layer}.input_layernorm.weight",
+                     f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.q_layernorm.weight": f"mtp.layers.{mtp_layer}.self_attn.q_norm.weight",
+                     f"language_model.mtp.layers.{mtp_layer}.transformer_layer.self_attention.k_layernorm.weight": f"mtp.layers.{mtp_layer}.self_attn.k_norm.weight",
+@@ -811,11 +813,18 @@ class Qwen35VLBridge(MegatronModelBridge):
+                             k=f"mtp.layers.{mtp_layer}.self_attn.k_proj.weight",
+                             v=f"mtp.layers.{mtp_layer}.self_attn.v_proj.weight",
+                         ),
++                        # Dense MLP mappings for MTP layers (used by non-MoE models like Qwen3.5-9B).
++                        # Megatron dense MLP uses mlp.linear_fc1 (gate+up), mlp.linear_fc2 (down),
++                        # and mlp.linear_fc1.layer_norm (pre-MLP layernorm).
+                         GatedMLPMapping(
+-                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.linear_fc1.weight",
++                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.linear_fc1.weight",
+                             gate=f"mtp.layers.{mtp_layer}.mlp.gate_proj.weight",
+                             up=f"mtp.layers.{mtp_layer}.mlp.up_proj.weight",
+                         ),
++                        AutoMapping(
++                            megatron_param=f"language_model.mtp.layers.{mtp_layer}.transformer_layer.mlp.linear_fc2.weight",
++                            hf_param=f"mtp.layers.{mtp_layer}.mlp.down_proj.weight",
++                        ),
+                     ]
+                 )
+ 
 diff --git a/mindspeed_bridge/models/qwen_vl/qwen35_vl_provider.py b/mindspeed_bridge/models/qwen_vl/qwen35_vl_provider.py
 index d495c47..f08ea49 100644
 --- a/mindspeed_bridge/models/qwen_vl/qwen35_vl_provider.py
