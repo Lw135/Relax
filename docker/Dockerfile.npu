@@ -39,7 +39,7 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 
 WORKDIR /workspace
 
-COPY . /workspace
+COPY . /root/Relax
 
 # Define environments
 ENV DEBIAN_FRONTEND=noninteractive
@@ -141,22 +141,18 @@ RUN cd /root/MindSpeed && git checkout core_r0.16.0 && pip install -r requiremen
     cd /root/Megatron-Bridge && git checkout v0.3.1 && \
     cd /root/MindSpeed-Bridge && git checkout 3655c07cbcc9 && pip install -r requirements.txt && bash tools/install_auto.sh
 
-RUN git clone https://github.com/redai-infra/Relax.git --branch main /root/Relax && \
-    cd /root/Relax && git checkout e59cd7288
 
 # Patch Megatron-LM, MindSpeed, MindSpeed-Bridge
 RUN cd /root/MindSpeed && \
-    patch -p1 < /workspace/mindspeed.patch && \
+    patch -p1 < /root/Relax/docker/npu_patch/mindspeed.patch && \
     cd /root/Megatron-Bridge && \
     patch -p1 < /root/Relax/docker/npu_patch/megatron-bridge.patch && \
     cd /root/Megatron-LM && \
     patch -p1 < /root/Relax/docker/npu_patch/megatron.patch && \
     cd /root/MindSpeed-Bridge && \
-    patch -p1 < /workspace/mindspeed-bridge.patch && \
+    patch -p1 < /root/Relax/docker/npu_patch/mindspeed-bridge.patch && \
     cd /sgl-workspace/sglang && \
-    patch -p1 < /workspace/sglang.patch && \
-    cd /root/Relax && \
-    patch -p1 < /workspace/relax.patch
+    patch -p1 < /root/Relax/docker/npu_patch/sglang-npu.patch && \
 
 # Patch torch_memory_saver
 RUN sed -i '164a\            torch.npu.empty_cache()' /usr/local/python3.11.15/lib/python3.11/site-packages/torch_memory_saver/entrypoint.py
