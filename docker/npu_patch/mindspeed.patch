@@ -93,3 +93,252 @@ index f14b231d..881c7fdb 100644
      full_args = get_full_args()
      for k, v in args.items():
          setattr(full_args, k, v)
+diff --git a/mindspeed/ops/triton/l2norm.py b/mindspeed/ops/triton/l2norm.py
+index 0050bce3..a9791a2d 100644
+--- a/mindspeed/ops/triton/l2norm.py
++++ b/mindspeed/ops/triton/l2norm.py
+@@ -5,23 +5,13 @@
+ from typing import Optional
+ 
+ import torch
+-import torch.nn as nn
++from torch import nn
+ import triton
+ import triton.language as tl
+ 
+-from mindspeed.ops.triton.utils import input_guard, is_amd
++from mindspeed.ops.triton.utils import input_guard
+ 
+-BT_LIST = [8, 16, 32, 64, 128]
+-NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if is_amd else [1, 2, 4, 8, 16, 32]
+ 
+-
+-@triton.autotune(
+-    configs=[
+-        triton.Config({}, num_warps=num_warps)
+-        for num_warps in NUM_WARPS_AUTOTUNE
+-    ],
+-    key=['D']
+-)
+ @triton.jit
+ def l2norm_fwd_kernel1(
+     x,
+@@ -45,13 +35,13 @@ def l2norm_fwd_kernel1(
+     tl.store(rstd + i_t, b_rstd)
+ 
+ 
+-@triton.autotune(
+-    configs=[
+-        triton.Config({}, num_warps=num_warps)
+-        for num_warps in NUM_WARPS_AUTOTUNE
+-    ],
+-    key=['D']
+-)
++#@triton.autotune(
++ #   configs=[
++  #      triton.Config({}, num_warps=num_warps)
++   #     for num_warps in NUM_WARPS_AUTOTUNE
++   # ],
++   # key=['D']
++#)
+ @triton.jit
+ def l2norm_bwd_kernel1(
+     y,
+@@ -76,14 +66,14 @@ def l2norm_bwd_kernel1(
+     tl.store(dx + cols, b_dx, mask=mask)
+ 
+ 
+-@triton.autotune(
+-    configs=[
+-        triton.Config({'BT': BT}, num_warps=num_warps)
+-        for num_warps in [1, 2, 4, 8, 16]
+-        for BT in BT_LIST
+-    ],
+-    key=['D', 'NB']
+-)
++#@triton.autotune(
++#    configs=[
++#        triton.Config({'BT': BT}, num_warps=num_warps)
++#        for num_warps in [1, 2, 4, 8, 16]
++#        for BT in BT_LIST
++#    ],
++#    key=['D', 'NB']
++#)
+ @triton.jit
+ def l2norm_fwd_kernel(
+     x,
+@@ -113,14 +103,14 @@ def l2norm_fwd_kernel(
+             tl.store(p_rstd, b_rstd.to(p_rstd.dtype.element_ty), boundary_check=(0,))
+ 
+ 
+-@triton.autotune(
+-    configs=[
+-        triton.Config({'BT': BT}, num_warps=num_warps)
+-        for num_warps in [1, 2, 4, 8, 16]
+-        for BT in BT_LIST
+-    ],
+-    key=['D', 'NB']
+-)
++#@triton.autotune(
++#    configs=[
++#        triton.Config({'BT': BT}, num_warps=num_warps)
++#        for num_warps in [1, 2, 4, 8, 16]
++#        for BT in BT_LIST
++#    ],
++#    key=['D', 'NB']
++#)
+ @triton.jit
+ def l2norm_bwd_kernel(
+     y,
+@@ -188,11 +178,12 @@ def l2norm_fwd(
+     rstd = torch.empty((T,), dtype=torch.float32, device=x.device)
+     if D <= 512:
+         NB = triton.cdiv(T, 2048)
++        BT = 32
+         bt_size = 32
+ 
+         def grid(meta):
+-            new_bt = meta['BT'] * bt_size
+-            return (triton.cdiv(T, new_bt), )
++            new_bt = BT * bt_size
++            return (triton.cdiv(T, new_bt),)
+ 
+         l2norm_fwd_kernel[grid](
+             x=x,
+@@ -203,6 +194,7 @@ def l2norm_fwd(
+             D=D,
+             BD=BD,
+             NB=NB,
++            BT=BT,
+             bt_size=bt_size,
+         )
+     else:
+@@ -238,6 +230,7 @@ def l2norm_bwd(
+ 
+     if D <= 512:
+         NB = triton.cdiv(T, 2048)
++        BT=32
+         bt_size = 40
+         l2norm_bwd_kernel[(bt_size,)](
+             y=y,
+@@ -249,6 +242,7 @@ def l2norm_bwd(
+             D=D,
+             BD=BD,
+             NB=NB,
++            BT=BT,
+             bt_size=bt_size,
+         )
+     else:
+diff --git a/mindspeed/ops/triton/sort_chunks_by_idx.py b/mindspeed/ops/triton/sort_chunks_by_idx.py
+index 2df2a431..db80bd41 100644
+--- a/mindspeed/ops/triton/sort_chunks_by_idx.py
++++ b/mindspeed/ops/triton/sort_chunks_by_idx.py
+@@ -3,10 +3,21 @@
+ 
+ from typing import Tuple
+ import torch
++import functools
+ import triton
+ import triton.language as tl
+ 
+ 
++@functools.cache
++def get_vector_num() -> int:
++ 	from triton.runtime import driver
++ 	import torch_npu
++
++ 	device = torch_npu.npu.current_device()
++ 	properties = driver.active.utils.get_device_properties(device)
++ 	return properties["num_vectorcore"]
++
++
+ @triton.autotune(
+     configs=[
+         triton.Config({'SUB_BLOCK_SIZE': 8}),
+@@ -37,6 +48,7 @@ def _make_chunk_sort_map_kernel(
+     IDX_LOAD_WIDTH: tl.constexpr,
+ ):
+     pid = tl.program_id(0)
++    pid_start = pid * BLOCK_SIZE
+ 
+     load_split_offset = tl.arange(0, IDX_LOAD_WIDTH)
+     input_split_sizes = tl.load(
+@@ -45,23 +57,33 @@ def _make_chunk_sort_map_kernel(
+     input_split_sizes_cumsum = tl.cumsum(input_split_sizes)
+ 
+     for off in range(0, BLOCK_SIZE, SUB_BLOCK_SIZE):
+-        token_offsets = pid * BLOCK_SIZE + off + tl.arange(0, SUB_BLOCK_SIZE)
++        block_offsets = off + tl.arange(0, SUB_BLOCK_SIZE)
++        token_offsets = pid_start + block_offsets
+         token_offsets_cmp = token_offsets.to(tl.float32)
+ 
+         input_split_sizes_mask = tl.where(input_split_sizes_cumsum[None, :] <= token_offsets_cmp[:, None], 1, 0)
+         input_chunk_indices = tl.sum(input_split_sizes_mask, axis=-1)
+         cumsum_mask = input_chunk_indices < (num_splits + 1)
+-        input_split_sizes_presums = tl.load(cumsum_ptr + input_chunk_indices, mask=cumsum_mask, other=0)
++        #input_split_sizes_presums = tl.load(cumsum_ptr + input_chunk_indices, mask=cumsum_mask, other=0)
++        safe_indices = tl.where(cumsum_mask, input_chunk_indices, 0)
++        input_split_sizes_presums = tl.load(cumsum_ptr + safe_indices, mask=cumsum_mask, other=0)
+ 
+         inv_mask = input_chunk_indices < num_splits
+-        output_chunk_indices = tl.load(inverse_sorted_indices_ptr + input_chunk_indices, mask=inv_mask, other=0)
++        #output_chunk_indices = tl.load(inverse_sorted_indices_ptr + input_chunk_indices, mask=inv_mask, other=0)
++        safe_inv_indices = tl.where(inv_mask, input_chunk_indices, 0)
++        output_chunk_indices = tl.load(inverse_sorted_indices_ptr + safe_inv_indices, mask=inv_mask, other=0)
+ 
+         output_chunk_mask = output_chunk_indices < (num_splits + 1)
+-        output_presums = tl.load(output_cumsum_ptr + output_chunk_indices, mask=output_chunk_mask, other=0)
++        #output_presums = tl.load(output_cumsum_ptr + output_chunk_indices, mask=output_chunk_mask, other=0)
++        safe_out_indices = tl.where(output_chunk_mask, output_chunk_indices, 0)
++        output_presums = tl.load(output_cumsum_ptr + safe_out_indices, mask=output_chunk_mask, other=0)
+ 
+         dst_rows = output_presums + token_offsets_cmp - input_split_sizes_presums
+-        store_mask = token_offsets < num_tokens 
+-        tl.store(dst_rows_ptr + token_offsets, dst_rows, mask=store_mask)
++        #store_mask = token_offsets < num_tokens 
++        #tl.store(dst_rows_ptr + token_offsets, dst_rows, mask=store_mask)
++        store_mask = (block_offsets < BLOCK_SIZE) & (token_offsets < num_tokens)
++        safe_token_offsets = tl.where(store_mask, token_offsets, 0)
++        tl.store(dst_rows_ptr + safe_token_offsets, dst_rows, mask=store_mask)
+ 
+ 
+ def make_chunk_sort_map(
+@@ -85,7 +107,7 @@ def make_chunk_sort_map(
+         Number of splits of split_sizes and sorted_indices.
+     """
+     row_id_map = torch.empty((num_tokens,), dtype=torch.int32, device="npu")
+-    num_blocks = min(48, num_tokens)
++    num_blocks = min(get_vector_num(), num_tokens)
+     block_size = triton.cdiv(num_tokens, num_blocks)
+     grid = (num_blocks, 1, 1)
+ 
+@@ -144,11 +166,11 @@ def _sort_chunks_by_map_kernel(
+ 
+     for i in range(pid_start, pid_end):
+         if FORWARD:
+-            src_row = i
++            src_row = i.to(tl.int64)
+             dst_row = tl.load(row_id_map_ptr + i).to(tl.int64)
+         else:
+             src_row = tl.load(row_id_map_ptr + i).to(tl.int64)
+-            dst_row = i
++            dst_row = i.to(tl.int64)
+ 
+         current_offset = tl.arange(0, hidden_size)
+         input_offsets = src_row * stride_input_token + current_offset * stride_input_hidden
+@@ -196,7 +218,7 @@ def sort_chunks_by_map(
+     else:
+         permuted_probs = None
+ 
+-    num_blocks = 48
++    num_blocks = min(get_vector_num(), num_tokens)
+     block_size = triton.cdiv(num_tokens, num_blocks)
+     grid = (num_blocks, 1, 1)
+     _sort_chunks_by_map_kernel[grid](
+@@ -345,4 +367,4 @@ def moe_sort_chunks_by_index_with_probs(
+         Chunk indices used to permute the chunks.
+     """
+     output, permuted_probs = _moe_chunk_sort.apply(inp, split_sizes, sorted_index, probs)
+-    return output, permuted_probs
+\ No newline at end of file
++    return output, permuted_probs
