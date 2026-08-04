@@ -1,8 +1,39 @@
 diff --git a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
-index b14c561..da6c412 100644
+index b14c561..53fd91b 100644
 --- a/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
 +++ b/contrib/torch_memory_saver/python/torch_memory_saver/entrypoint.py
-@@ -159,6 +159,7 @@ class _TorchMemorySaverImpl:
+@@ -36,6 +36,7 @@ class TorchMemorySaver:
+         capture_error_mode="global",
+         tag: str = _TAG_DEFAULT,
+         enable_cpu_backup: bool = False,
++        **kwargs,
+     ):
+         """Similar to `torch.cuda.graph`, but ensures memory in it to be pauseable."""
+         self._ensure_initialized()
+@@ -46,6 +47,7 @@ class TorchMemorySaver:
+             capture_error_mode=capture_error_mode,
+             tag=tag,
+             enable_cpu_backup=enable_cpu_backup,
++            **kwargs
+         ):
+             yield
+ 
+@@ -115,12 +117,13 @@ class _TorchMemorySaverImpl:
+         capture_error_mode,
+         tag: str,
+         enable_cpu_backup: bool,
++        **kwargs,
+     ):
+         assert (
+             self._hook_mode == "preload"
+         ), "Only hook_mode=preload supports pauseable CUDA Graph currently"
+         with torch.npu.graph(
+-            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode
++            cuda_graph, pool=pool, stream=stream, capture_error_mode=capture_error_mode, **kwargs
+         ):
+             with self._with_region_config(tag=tag, enable_cpu_backup=enable_cpu_backup):
+                 yield
+@@ -159,6 +162,7 @@ class _TorchMemorySaverImpl:
              # only be released after the memory region is resumed and empty_cache() is invoked.
              torch_npu._C._npu_releasePool(torch.npu.current_device(), pool.id)
              del pool
