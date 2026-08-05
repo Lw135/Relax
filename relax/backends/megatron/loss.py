@@ -583,7 +583,13 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
                 k[-1] += reward
             rewards.append(k)
         advantages, returns = get_advantages_and_returns_batch(
-            total_lengths, response_lengths, values, rewards, args.gamma, args.lambd
+            total_lengths,
+            response_lengths,
+            values,
+            rewards,
+            args.gamma,
+            args.lambd,
+            padded_total_lengths=padded_total_lengths,
         )
 
     elif args.advantage_estimator == "reinforce_plus_plus":
@@ -1022,9 +1028,22 @@ def policy_loss_function(
     train_rollout_logprob_abs_diff = None
     if "rollout_log_probs" in batch and batch["rollout_log_probs"] is not None:
         rollout_log_probs = torch.cat(batch["rollout_log_probs"], dim=0)
-        train_rollout_logprob_abs_diff = sum_of_sample_mean((old_log_probs - rollout_log_probs).abs())
+        # Train/inference mismatch = |train-engine logprob - rollout-engine logprob| for
+        # the SAME tokens+weights. old_log_probs is the wrong reference under
+        # --use-rollout-logprobs: there old_log_probs IS rollout_log_probs (see the
+        # assignment above), so the diff would collapse to 0. Use the actor-fwd
+        # train-side recompute (batch["log_probs"], populated when --get-mismatch-metrics
+        # forces the extra forward) and fall back to this step's fresh forward log_probs
+        # otherwise (colocate on-policy: rollout weights == current weights).
+        if not args.use_rollout_logprobs:
+            train_side_log_probs = old_log_probs
+        elif batch.get("log_probs"):
+            train_side_log_probs = torch.cat(batch["log_probs"], dim=0)
+        else:
+            train_side_log_probs = log_probs.detach()
+        train_rollout_logprob_abs_diff = sum_of_sample_mean((train_side_log_probs - rollout_log_probs).abs())
         train_rollout_prob_abs_diff = sum_of_sample_mean(
-            (torch.exp(old_log_probs) - torch.exp(rollout_log_probs)).abs()
+            (torch.exp(train_side_log_probs) - torch.exp(rollout_log_probs)).abs()
         )
 
     reported_loss = {
@@ -1152,6 +1171,8 @@ def sft_loss_function(
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
         padded_total_lengths=batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
@@ -1200,6 +1221,8 @@ def sft_loss_function_chunked(
         with_entropy=False,
         max_seq_lens=batch.get("max_seq_lens", None),
         padded_total_lengths=batch.get("padded_total_lengths", None),
+        dynamic_cp_size=batch.get("dynamic_cp_size", None),
+        dynamic_cp_rank=batch.get("dynamic_cp_rank", None),
         lm_head_forward=lm_head_forward,
     )
 
