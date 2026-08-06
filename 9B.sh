@@ -13,9 +13,9 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 ulimit -n 65535
 
-export HCCL_SOCKET_IFNAME=enx00e04c683d6a
-export GLOO_SOCKET_IFNAME=enx00e04c683d6a
-export TP_SOCKET_IFNAME=enx00e04c683d6a
+export HCCL_SOCKET_IFNAME=enp48s3u1u1
+export GLOO_SOCKET_IFNAME=enp48s3u1u1
+export TP_SOCKET_IFNAME=enp48s3u1u1
 export HCCL_CONNECT_TIMEOUT=1200
 export RAY_DEDUP_LOGS=0
 export PYTHONBUFFERED=1
@@ -23,7 +23,7 @@ export PYTHONBUFFERED=1
 now=$(date "+%Y-%m-%d-%H:%M:%S")
 echo "当前时间: $now"
 export ASCEND_COREDUMP_SIGNAL=none
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export HCCL_HOST_SOCKET_PORT_RANGE=63000-63050
 export HCCL_NPU_SOCKET_PORT_RANGE=64000-64050
 export TMS_HOOK_MODE="preload"
@@ -66,11 +66,11 @@ ROLLOUT_ARGS=(
     --rm-type dapo
     --reward-key score
     --num-rollout ${NUM_ROLLOUT}
-    --rollout-batch-size 16
+    --rollout-batch-size 32
     --n-samples-per-prompt 8
     --rollout-max-response-len 8192
     --rollout-temperature 1
-    --global-batch-size 128
+    --global-batch-size 256
     --use-fault-tolerance
 )
 
@@ -98,7 +98,7 @@ PERF_ARGS=(
     # Packing is not supported for GDN currently
     --qkv-format bshd
     --micro-batch-size 1
-    --max-tokens-per-gpu 20480
+    --max-tokens-per-gpu 10240
     --no-rope-fusion
     --no-gradient-accumulation-fusion
     --balance-data
@@ -131,10 +131,10 @@ OPTIMIZER_ARGS=(
 )
 
 SGLANG_ARGS=(
-    --rollout-num-gpus-per-engine 8
-    --sglang-mem-fraction-static 0.3
+    --rollout-num-gpus-per-engine 4
+    --sglang-mem-fraction-static 0.8
     --sglang-max-running-requests 132
-    --sglang-cuda-graph-bs 4 8 16 32 64 128
+    --sglang-cuda-graph-bs 4 8 16 32 64 128 192 256
     --sglang-device npu
     # --sglang-disable-radix-cache
     --mamba-scheduler-strategy extra_buffer
@@ -171,6 +171,7 @@ mkdir -p log
     -- python3 -m relax.entrypoints.train \
     --resource '{"actor": [1, 16], "rollout": [1, 16]}'\
     --max-staleness 0 \
+    --num-data-storage-units 1 \
     --colocate \
     --nnodes 1 \
     --num-gpus-per-node 16 \
