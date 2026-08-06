@@ -133,7 +133,7 @@ OPTIMIZER_ARGS=(
 SGLANG_ARGS=(
     --rollout-num-gpus-per-engine 4
     --sglang-mem-fraction-static 0.8
-    --sglang-max-running-requests 132
+    --sglang-max-running-requests 256
     --sglang-cuda-graph-bs 4 8 16 32 64 128 192 256
     --sglang-device npu
     # --sglang-disable-radix-cache
