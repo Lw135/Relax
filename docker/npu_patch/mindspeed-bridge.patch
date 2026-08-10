@@ -19,18 +19,42 @@ index 99ccba5..8fa07a1 100644
              # Set the cleaned value (or None if it was removed)
              setattr(cleaned_obj, attr_name, cleaned_value)
 diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py
-index 818af29..ef97078 100644
+index 818af29..1e310db 100644
 --- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py
 +++ b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/gated_delta_net.py
-@@ -191,7 +191,7 @@ class GatedDeltaNet(MegatronModule):
+@@ -191,8 +191,8 @@ class GatedDeltaNet(MegatronModule):
          )
          setattr(self.A_log, "tensor_model_parallel", True)
  
 -        if HAVE_FLA and self.use_triton_gdn:
+-            self.gated_delta_rule = chunk_gated_delta_rule
 +        if HAVE_FLA:
-             self.gated_delta_rule = chunk_gated_delta_rule
++            self.gated_delta_rule = flash_gated_delta_rule
          elif self.use_ascend_gdn:
              self.gated_delta_rule = flash_gated_delta_rule
+         else:
+diff --git a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/model.py b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+index 32939f8..9f054c2 100644
+--- a/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/model.py
++++ b/mindspeed_bridge/models/qwen_vl/modelling_qwen3_vl/model.py
+@@ -501,7 +501,7 @@ class Qwen3VLModel(MegatronModule):
+                 combined_embeddings = split_data_cp_rank(combined_embeddings, cp_size, 0, cp_rank)
+             if packed_seq_params is not None:
+                 if attention_mask is None:
+-                    attention_mask = torch.ones_like(input_ids, dtype=torch.int32, device=input_ids.device)
++                    attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
+                 input_ids_thd, _ = preprocess_packed_seqs(
+                     input_ids,
+                     attention_mask,
+@@ -560,7 +560,7 @@ class Qwen3VLModel(MegatronModule):
+             # convert lm_input_ids to THD format so it matches position_ids.
+             if packed_seq_params is not None:
+                 if attention_mask is None:
+-                    attention_mask = torch.ones_like(input_ids, dtype=torch.int32, device=input_ids.device)
++                    attention_mask = torch.ones_like(input_ids, dtype=torch.bool, device=input_ids.device)
+                 lm_input_ids, _ = preprocess_packed_seqs(
+                     input_ids,
+                     attention_mask,
 diff --git a/mindspeed_bridge/models/qwen_vl/qwen35_vl_provider.py b/mindspeed_bridge/models/qwen_vl/qwen35_vl_provider.py
 index d495c47..f08ea49 100644
 --- a/mindspeed_bridge/models/qwen_vl/qwen35_vl_provider.py

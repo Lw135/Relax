@@ -1,76 +1,138 @@
-#
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-ARG NO_PROXY
-FROM quay.io/ascend/cann:8.5.1-a3-ubuntu22.04-py3.11
+ARG CANN_VERSION=9.0.0
+ARG DEVICE_TYPE=a3
+ARG OS=ubuntu22.04
+ARG PYTHON_VERSION=py3.11
 
-ARG HTTP_PROXY
-ARG HTTPS_PROXY
-ARG NO_PROXY
-ARG http_proxy
-ARG https_proxy
-ARG no_proxy
+FROM quay.io/ascend/cann:$CANN_VERSION-$DEVICE_TYPE-$OS-$PYTHON_VERSION
 
-ENV http_proxy=${HTTP_PROXY} \
-    https_proxy=${HTTPS_PROXY} \
-    HTTP_PROXY=${HTTP_PROXY} \
-    HTTPS_PROXY=${HTTPS_PROXY} \
-    no_proxy=${NO_PROXY} \
-    NO_PROXY=${NO_PROXY}
+ENV http_proxy http://p_atlas:proxy%40123@80.252.8.1:8080
+ENV https_proxy http://p_atlas:proxy%40123@80.252.8.1:8080
 
-WORKDIR /root
-ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+# Update pip & apt sources
+ARG TARGETARCH="arm64"
+ARG CANN_VERSION
+ARG DEVICE_TYPE
+ARG PIP_INDEX_URL="https://pypi.org/simple/"
+ARG APTMIRROR=""
+ARG PYTORCH_VERSION="2.10.0"
+ARG TORCHVISION_VERSION="0.25.0"
+ARG TORCHAUDIO_VERSION="2.10.0"
+ARG PTA_URL_ARM64="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.10.0/torch_npu-2.10.0-cp311-cp311-manylinux_2_28_aarch64.whl"
+ARG PTA_URL_AMD64="https://gitcode.com/Ascend/pytorch/releases/download/v26.0.0-pytorch2.10.0/torch_npu-2.10.0-cp311-cp311-manylinux_2_28_x86_64.whl"
+ARG SGLANG_TAG=main
+ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
+ARG SGLANG_KERNEL_NPU_TAG="2026.7.2"
+ARG arch="aarch64"
+ARG FLA_LIB="/usr/local/python3.11.15/lib/python3.11/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_api/lib"
 
-RUN if [ -n "$HTTP_PROXY" ]; then \
-      echo "Acquire::http::Proxy \"$HTTP_PROXY\";" > /etc/apt/apt.conf.d/99proxy; \
-      echo "Acquire::https::Proxy \"$HTTPS_PROXY\";" >> /etc/apt/apt.conf.d/99proxy; \
+ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
+ARG DEVICE_TYPE
+
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      echo "Using x86_64 dependencies"; \
+      echo "PTA_URL=$PTA_URL_AMD64" >> /etc/environment_new; \
+    elif [ "$TARGETARCH" = "arm64" ]; then \
+      echo "Using aarch64 dependencies"; \
+      echo "PTA_URL=$PTA_URL_ARM64" >> /etc/environment_new; \
+    else \
+      echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1; \
     fi
 
-RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y --no-install-recommends \
-        gcc g++ cmake libnuma-dev wget git curl jq vim \
-        build-essential patchelf tmux net-tools htop nano iputils-ping \
-        autoconf automake libatlas-base-dev libgoogle-glog-dev libbz2-dev libc-ares2 \
-        libleveldb-dev liblmdb-dev libprotobuf-dev libsnappy-dev libtool nasm protobuf-compiler pkg-config unzip sox \
-        libsndfile1 libpng-dev libhdf5-dev gfortran rapidjson-dev ninja-build libedit-dev rsync && \
-    apt-get clean && \
-    rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/*
-
-# Setting env
-RUN ARCH=$(uname -m) && \
-    if [ "$ARCH" = "aarch64" ]; then \
-        export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/aarch64-linux/devlib/linux/aarch64:$LD_LIBRARY_PATH; \
-    elif [ "$ARCH" = "x86_64" ]; then \
-        export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/x86_64-linux/devlib/linux/x86_64/:$LD_LIBRARY_PATH; \
-    fi && \
-    source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
-    source /usr/local/Ascend/nnal/atb/set_env.sh
-# Setting pip & git config. Global config (set once, persists across subsequent RUN layers)
-ARG PIP_INDEX_URL="https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
-RUN pip config set global.index-url ${PIP_INDEX_URL} && \
-    git config --global http.sslverify false && \
-    git config --global http.postBuffer 2147483648 && \
-    git config --global user.email "temp@example.com" && \
-    git config --global user.name "temp"
-WORKDIR /root
+WORKDIR /workspace
 
 COPY . /root/Relax
-RUN pip install --upgrade pip packaging setuptools==80.10.2 && \
-    pip install torch==2.9.0 && \
-    pip install numpy==1.26.0
-    # build torch_npu
-RUN pip install pyyaml && \
-    git clone https://gitcode.com/Ascend/pytorch.git /root/pytorch && \
-    cd /root/pytorch && \
-    git checkout v2.9.0-7.3.0 && \
-    git cherry-pick -n f495de675bce38a2fa21edbf067b73d2a5f26733 && \
-    bash ci/build.sh --python=3.11 && \
-    pip install dist/torch_npu-2.9.0*.whl
-RUN cd /root && rm -rf /root/pytorch && \
-    pip install triton-ascend==3.2.0 && \
-    pip install tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
-    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps
 
-    # Clone Megatron-LM, MindSpeed, MindSpeed-Bridge, Megatron-Bridge and install
+# Define environments
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN pip config set global.index-url $PIP_INDEX_URL
+RUN git config --global http.sslverify false
+RUN if [ -n "$APTMIRROR" ];then sed -i "s|.*.ubuntu.com|$APTMIRROR|g" /etc/apt/sources.list ;fi
+
+# Install development tools and utilities
+RUN apt-get update -y && apt upgrade -y && apt-get install -y \
+    unzip \
+    build-essential \
+    cmake \
+    vim \
+    wget \
+    curl \
+    net-tools \
+    zlib1g-dev \
+    lld \
+    clang \
+    locales \
+    ccache \
+    openssl \
+    libssl-dev \
+    pkg-config \
+    libgl1-mesa-glx \
+    libgl1-mesa-dri \
+    ca-certificates \
+    gawk \
+    && rm -rf /var/cache/apt/* \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-ca-certificates \
+    && locale-gen en_US.UTF-8
+
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
+
+
+### Install MemFabric
+RUN ${PIP_INSTALL} memfabric-hybrid==1.0.8
+
+### Install zbal
+RUN if [ "$TARGETARCH" = "arm64" ]; then \
+      ${PIP_INSTALL} memfabric-zbal==1.1.1; \
+    fi
+
+### Install SGLang Model Gateway
+RUN ${PIP_INSTALL} sglang-router
+
+
+### Install PyTorch and PTA
+RUN . /etc/environment_new && \
+    (${PIP_INSTALL} torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION}) \
+    && (${PIP_INSTALL} ${PTA_URL})
+
+
+## Install triton-ascend
+RUN (${PIP_INSTALL} pybind11) && \
+    (${PIP_INSTALL} triton-ascend==3.2.1.dev20260530 --extra-index-url=https://mirrors.huaweicloud.com/ascend/repos/pypi/nightly --trusted-host triton-ascend.osinfra.cn)
+
+# Install SGLang (editable mode to preserve source and git history)
+RUN git clone https://github.com/sgl-project/sglang --branch $SGLANG_TAG /sgl-workspace/sglang && \
+    cd /sgl-workspace/sglang/python && git checkout bd3f6a7935 && rm -rf pyproject.toml && mv pyproject_npu.toml pyproject.toml && \
+    ${PIP_INSTALL} -v -e .[all_npu]
+
+RUN mkdir cann-custom-ops && \
+    cd cann-custom-ops && \
+    wget --no-check-certificate https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/custom-ops-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip && \
+    wget --no-check-certificate https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/ops-transformer-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip && \
+    unzip custom-ops-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip && \
+    unzip ops-transformer-${SGLANG_KERNEL_NPU_TAG}-torch2.10.0-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip && \
+    chmod +x *.run && \
+    ./CANN-custom_ops-none-linux.$(arch).run --install-path=/usr/local/Ascend/cann-${CANN_VERSION}/opp && \
+    ./cann-ops-transformer-custom_linux-$(arch).run --install-path=/usr/local/Ascend/cann-${CANN_VERSION}/opp && \
+    ${PIP_INSTALL} custom_ops-1.0-cp311-cp311-linux_$(arch).whl && \
+    cd .. && rm -rf cann-custom-ops
+
+# Install Deep-ep
+# pin wheel to 0.45.1 ref: https://github.com/pypa/wheel/issues/662
+RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil && \
+    git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu && \
+    cd /root/sgl-kernel-npu && git checkout 2026.7.2 && \
+    patch -p1 < /root/Relax/docker/npu_patch/torch-memory-saver.patch  && \
+    bash build.sh -a kernels && bash build.sh -a memory-saver && bash build.sh -a deepep && \
+    pip install output/*.whl && \
+    cd "$(pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so && \
+    cd /root && rm -rf /root/sgl-kernel-npu 
+
+RUN pip install tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
+    pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@dcc78f0a021284412921217fde71fea7cb276ffc" --no-deps
+
 RUN git clone https://gitcode.com/ascend/MindSpeed.git /root/MindSpeed && \
     git clone https://github.com/NVIDIA/Megatron-LM.git /root/Megatron-LM && \
     git clone https://gitcode.com/ascend/MindSpeed-Bridge.git /root/MindSpeed-Bridge && \
@@ -81,6 +143,7 @@ RUN cd /root/MindSpeed && git checkout core_r0.16.0 && pip install -r requiremen
     cd /root/Megatron-Bridge && git checkout v0.3.1 && \
     cd /root/MindSpeed-Bridge && git checkout 3655c07cbcc9 && pip install -r requirements.txt && bash tools/install_auto.sh
 
+
 # Patch Megatron-LM, MindSpeed, MindSpeed-Bridge
 RUN cd /root/MindSpeed && \
     patch -p1 < /root/Relax/docker/npu_patch/mindspeed.patch && \
@@ -89,40 +152,57 @@ RUN cd /root/MindSpeed && \
     cd /root/Megatron-LM && \
     patch -p1 < /root/Relax/docker/npu_patch/megatron.patch && \
     cd /root/MindSpeed-Bridge && \
-    patch -p1 < /root/Relax/docker/npu_patch/mindspeed-bridge.patch
+    patch -p1 < /root/Relax/docker/npu_patch/mindspeed-bridge.patch && \
+    cd /sgl-workspace/sglang && \
+    patch -p1 < /root/Relax/docker/npu_patch/sglang-npu.patch
+
+# Patch torch_memory_saver
+# RUN 
+#     sed -i '164a\**kwargs' /usr/local/python3.11.15/lib/python3.11/site-packages/torch_memory_saver/entrypoint.py      
+#     sed -i '164a\            torch.npu.empty_cache()' /usr/local/python3.11.15/lib/python3.11/site-packages/torch_memory_saver/entrypoint.py
+
+# Install sgl-kernle-npu
+# RUN git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu && \
+#     cd /root/sgl-kernel-npu && git checkout 2026.07.02 && \
+#     patch -p1 < /root/Relax/docker/npu_patch/torch-memory-saver.patch  && \
+#     bash build.sh -a kernels && bash build.sh -a memory-saver && \
+#     pip install output/*.whl && \
+#     cd /root && rm -rf /root/sgl-kernel-npu 
 
 # Copy MindSpeed-Bridge, Megatron-Bridge into Megatron-LM
 RUN cp -r /root/MindSpeed-Bridge/mindspeed_bridge /root/Megatron-LM/ && \
     cp -r /root/Megatron-Bridge/src/megatron/bridge /root/Megatron-LM/megatron/ && \
     cd /root && rm -rf /root/MindSpeed-Bridge && rm -rf /root/Megatron-Bridge 
 
-# Install sglang
-RUN git clone https://github.com/sgl-project/sglang.git /root/sglang && \
-    cd /root/sglang && git checkout v0.5.10 && \
-    mv python/pyproject.toml python/pyproject.toml.backup && \
-    mv python/pyproject_npu.toml python/pyproject.toml && \
-    pip install -e "python[srt_npu]" --constraint <(echo "torch==2.9.0") && \
-    # [NPU] Fix Qwen3.5 inference acc.
-    git stash  && \
-    git fetch origin pull/23815/head:pr-23815 && \
-    git checkout pr-23815 && \
-    patch -p1 < /root/Relax/docker/npu_patch/sglang-npu.patch
-
-# Install sgl-kernle-npu
-RUN git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu && \
-    cd /root/sgl-kernel-npu && git checkout 2026.04.15.rc3 && \
-    # Adapt tms for colocate train.
-    git cherry-pick -n 23519771d347 --no-gpg-sign && \
-    patch -p1 < /root/Relax/docker/npu_patch/torch-memory-saver.patch  && \
-    bash build.sh -a kernels && bash build.sh -a memory-saver && \
-    pip install output/*.whl && \
-    cd /root && rm -rf /root/sgl-kernel-npu 
-
-# Install Relax
 RUN cd /root/Relax && pip install -e .
 
-RUN pip install ray==2.55.1 && pip install protobuf==6.33.6
+RUN ${PIP_INSTALL} ray==2.55.1 protobuf==6.33.6 torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} transformers==5.12.1 fastapi==0.139.1
 
-#Clean cache
-RUN pip cache purge && \
-    rm -rf /tmp/*
+RUN cd /root && \
+    git clone https://gitcode.com/Ascend/pytorch.git && \
+    cd pytorch && \
+    git checkout 8751b36d && \
+    git cherry-pick -n f495de675bce38a2fa21edbf067b73d2a5f26733 && \
+    bash ci/build.sh --python=3.11 && \
+    pip install dist/torch_npu-2.10.0*.whl --force-reinstall --no-deps
+
+RUN cd /root && \
+    mkdir tmp
+
+#  && \    sed -i '1883c\}' build.sh && \
+# SHELL ["/bin/bash", "-c"]
+RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
+    git clone https://github.com/flashserve/flash-linear-attention-npu.git /root/flash-linear-attention-npu && \
+    cd /root/flash-linear-attention-npu/ && \
+    git checkout v26.6.0 && \
+    FLA_NPU_SOC=ascend910_93 python -m pip wheel --no-build-isolation --no-deps . -w dist && \
+    python -m pip install --force-reinstall --no-deps dist/flash_linear_attention_npu-*.whl
+
+# merge fix
+RUN pip install patchelf && \
+    cp -a ${FLA_LIB}/libcust_opapi.so ${FLA_LIB}/libcust_opapi.so.bak && \
+    cp -a ${FLA_LIB}/libopapi.so ${FLA_LIB}/libopapi.so.bak && \
+    patchelf --set-soname libfla_cust_opapi.so ${FLA_LIB}/libcust_opapi.so && \
+    patchelf --set-soname libfla_cust_opapi.so ${FLA_LIB}/libopapi.so
+
+CMD ["/bin/bash"]
