@@ -340,20 +340,90 @@ diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sgl
              if self.forward_mode.is_decode():
                  # 3 * N
                  if mm_input is None or rl_on_policy_target is not None:
+diff --git a/python/sglang/srt/layers/logprob_processor.py b/python/sglang/srt/layers/logprob_processor.py
+index 5ea86a6a5b..8adc8160f2 100644
+--- a/python/sglang/srt/layers/logprob_processor.py
++++ b/python/sglang/srt/layers/logprob_processor.py
+@@ -673,16 +673,31 @@ class OutputLogprobProcessor:
+         top_logprobs_nums: List[int],
+         token_ids_logprobs: List[List[int]],
+         batch_next_token_ids: torch.Tensor,
++        logprobs_are_probs: bool,
+     ) -> LogprobResult:
+-        # clamp to avoid -inf values
+-        logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
++        # Clamp the extracted values instead of the full [batch, vocab]
++        # matrix. clamp(min=const) is elementwise and monotone
++        # non-decreasing, so it commutes with topk/gather: clamping the
++        # small outputs gives identical results (-inf -> finfo.min) while
++        # skipping a full-matrix read+write pass (~0.4 ms/step on NPU).
++        clamp_min = torch.finfo(logprobs.dtype).min
+ 
+         result = LogprobResult()
+         if any(x > 0 for x in top_logprobs_nums):
+-            (
+-                result.top_logprobs_val,
+-                result.top_logprobs_idx,
+-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
++            # Same extraction as get_top_logprobs, but clamp the
++            # [batch, max_k] topk result in a single kernel before
++            # slicing per request.
++            max_k = max(top_logprobs_nums)
++            top_vals, top_idx = logprobs.topk(max_k, dim=-1)
++            if logprobs_are_probs:
++                top_vals.log_()
++            top_vals.clamp_(min=clamp_min)
++            result.top_logprobs_val = [
++                top_vals[i][:k] for i, k in enumerate(top_logprobs_nums)
++            ]
++            result.top_logprobs_idx = [
++                top_idx[i][:k] for i, k in enumerate(top_logprobs_nums)
++            ]
+ 
+         if any(x is not None for x in token_ids_logprobs):
+             (
+@@ -691,11 +706,19 @@ class OutputLogprobProcessor:
+             ) = get_token_ids_logprobs(
+                 logprobs, token_ids_logprobs, no_copy_to_cpu=True
+             )
+-
+-        result.token_logprobs = logprobs[
+-            torch.arange(len(batch_next_token_ids), device=batch_next_token_ids.device),
+-            batch_next_token_ids,
+-        ]
++            for row in result.token_ids_logprobs_val:
++                if torch.is_tensor(row):
++                    if logprobs_are_probs:
++                        row.log_()
++                    row.clamp_(min=clamp_min)
++
++        # Gather one value per row directly; this removes the temporary arange
++        # and the 2-D advanced-index operation from the hot path.
++        token_indices = batch_next_token_ids.to(dtype=torch.long).view(-1, 1)
++        next_token_logprobs = torch.gather(logprobs, dim=1, index=token_indices).view(-1)
++        if logprobs_are_probs:
++            next_token_logprobs.log_()
++        result.token_logprobs = next_token_logprobs.clamp_(min=clamp_min)
+         return result
+ 
+     def compute_logprobs_only(
 diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index de587ec5f4..e1284295e2 100644
 --- a/python/sglang/srt/layers/sampler.py
 +++ b/python/sglang/srt/layers/sampler.py
-@@ -83,6 +83,158 @@
+@@ -83,6 +83,171 @@ class Sampler(nn.Module):
  
          self.output_logprob_processor = OutputLogprobProcessor()
  
 +        # Generate uniform noise on a side stream while the model is running, and
-+        # apply the exponential-race transform (-log) at consumption time on the
-+        # main stream. uniform_() decomposes to DSARandomUniform plus an async
++        # apply the exponential-race transform at consumption time on the main
++        # stream, exactly matching stock aten::exponential_ semantics (NPU
++        # op-plugin composite): x = min(1 - u, 1 - eps/2), q = -log(x).
++        # uniform_() decomposes to DSARandomUniform plus an async
 +        # D2D copy, i.e. pure DSA-engine work with no AIV transform kernels, so
 +        # the side stream cannot contend with the model's vector-core kernels
-+        # even when it overlaps the next forward (option A; v1 ran the full
-+        # exponential_() chain here and its AIV tail contended with forward).
++        # even when it overlaps the next forward (v1 ran the full exponential_()
++        # chain here and its AIV tail contended with forward).
 +        # This is opt-in because it changes the random-number sequence, although it
 +        # preserves the categorical sampling distribution.
 +        self.enable_async_exponential = is_npu() and get_bool_env_var(
@@ -363,19 +433,7 @@ diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/samp
 +        self._async_exponential_event = None
 +        self._async_exponential_u = None
 +        self._async_exponential_pending = False
-+        self._async_exponential_use_argmin = (
-+            self.enable_async_exponential and self._detect_npu_argmin()
-+        )
-+
-+    @staticmethod
-+    def _detect_npu_argmin() -> bool:
-+        """Return whether torch.argmin works on this torch_npu build."""
-+        try:
-+            torch.argmin(torch.ones(8, device="npu"))
-+            torch.npu.synchronize()
-+            return True
-+        except Exception:
-+            return False
++        self._async_exp_min_bound = None
 +
 +    def can_prepare_async_exponential(
 +        self, sampling_info: SamplingBatchInfo
@@ -420,7 +478,7 @@ diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/samp
 +            self._async_exponential_event = torch.npu.Event()
 +            logger.info(
 +                "Enabled asynchronous NPU exponential-race sampling "
-+                "(uniform noise on side stream)"
++                "(uniform noise on side stream, stock-exponential argmax consumption)"
 +            )
 +
 +        current_stream = torch.npu.current_stream()
@@ -455,9 +513,10 @@ diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/samp
 +    ) -> Optional[torch.Tensor]:
 +        """Consume precomputed U(0,1) noise using the exponential-race identity.
 +
-+        The -log transform runs here on the main stream (serial work that the
-+        sampling path owns anyway), keeping the side stream free of AIV
-+        kernels so it cannot slow down the model forward.
++        The full stock exponential_ transform (complement + clamp + -log) runs
++        here on the main stream (serial work that the sampling path owns
++        anyway), keeping the side stream free of AIV kernels so it cannot
++        slow down the model forward.
 +        """
 +        if not self._async_exponential_pending:
 +            return None
@@ -487,22 +546,44 @@ diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/samp
 +        u.record_stream(current_stream)
 +
 +        # Do not modify probs in place: the standard backend reuses it for logprobs.
-+        # log(u) <= 0; u == 0 gives log(u) = -inf, i.e. that element maps to
-+        # -0.0 in the race and is correctly never selected. argmin over
-+        # probs / log(u) equals argmax over probs / -log(u) and saves one
-+        # elementwise pass; fall back to the argmax form when argmin is not
-+        # supported by the torch_npu build.
-+        log_u = torch.log(u)
-+        if self._async_exponential_use_argmin:
-+            sampled_index = torch.div(probs, log_u).argmin(dim=-1)
-+        else:
-+            sampled_index = torch.div(probs, log_u.neg_()).argmax(dim=-1)
++        # argmax over probs / q with q ~ Exp(1): v1's production consumption
++        # form, kept because the stock argmax kernel is healthy while argmin at
++        # this shape is a slow legacy kernel (0.38ms vs ~0.13ms at bs=128).
++        # q is produced by transforming u in place with the exact stock
++        # aten::exponential_ values (NPU op-plugin composite, fp32 path):
++        #   x = min(1 - u, 1 - eps/2);  q = -log(x),  eps = finfo(dtype).eps
++        # The guard is a single torch.minimum against a cached 0-dim bound
++        # tensor: min(x, 1-eps/2) is bitwise-identical to stock's
++        # ge+masked_fill_ pair (x <= 1 always), and unlike clamp_max_ it stays
++        # on the template-grade aclnnMinimum kernel -- clamp_max_ routes to
++        # the legacy-family ClipByValueV2 op with two scalar->device uploads
++        # per call, which costs more than the unary-template kernels used by
++        # the rest of the chain. The cap keeps x below 1 so q can never be 0:
++        # u == 0 maps to q ~= 5.96e-8 and scores huge, exactly as stock (v2.3
++        # mapped it to +inf/+0.0 instead). For fp32 q stays within
++        # [~5.96e-8, ~16.6], finite and strictly positive, so the race has no
++        # inf/NaN edge.
++        # All transform ops run here on the main stream; the side stream stays
++        # pure DSA uniform with zero AIV kernels.
++        bound = self._async_exp_min_bound
++        if bound is None or bound.dtype != u.dtype or bound.device != u.device:
++            bound = torch.full(
++                (),
++                1.0 - torch.finfo(u.dtype).eps / 2.0,
++                dtype=u.dtype,
++                device=u.device,
++            )
++            self._async_exp_min_bound = bound
++        u.neg_().add_(1.0)
++        torch.minimum(u, bound, out=u)
++        u.log_().neg_()
++        sampled_index = torch.div(probs, u).argmax(dim=-1)
 +        return sampled_index.view(-1).to(torch.int32)
 +
      def _preprocess_logits(
          self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
      ) -> torch.Tensor:
-@@ -116,6 +268,9 @@
+@@ -116,6 +281,9 @@ class Sampler(nn.Module):
                  to get the unique seed for each position.
          """
          logits = logits_output.next_token_logits
@@ -512,7 +593,24 @@ diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/samp
  
          # Preprocess logits (custom processors and NaN handling)
          logits = self._preprocess_logits(logits, sampling_info)
-@@ -207,8 +362,9 @@
+@@ -186,9 +354,13 @@ class Sampler(nn.Module):
+                 # Standard path: do softmax and sample from probs.
+                 logits.div_(sampling_info.temperatures)
+ 
+-                # In-place op to save memory
+-                logits[:] = torch.softmax(logits, dim=-1)
+-                probs = logits
++                # Do not write the softmax output back into logits: the
++                # write-back costs a full-matrix TensorMove pass (~0.2 ms on
++                # NPU at bs=128 x vocab=248320 fp32). logits (now x/T) is not
++                # read again on this path and is overwritten by the next
++                # forward anyway. Trade-off: one extra live [batch, vocab]
++                # fp32 tensor during sampling. (post_sample v1 的 A1 改动)
++                probs = torch.softmax(logits, dim=-1)
+ 
+                 batch_next_token_ids = self._sample_from_probs(
+                     probs, sampling_info, positions, simple_sampling_case
+@@ -207,8 +379,9 @@ class Sampler(nn.Module):
                      logprobs = (
                          logprobs_via_logsoftmax_kernel
                          if logprobs_via_logsoftmax_kernel is not None
@@ -523,7 +621,7 @@ diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/samp
                  del probs
  
          if return_logprob:
-@@ -219,6 +375,7 @@
+@@ -219,6 +392,7 @@ class Sampler(nn.Module):
                  top_logprobs_nums,
                  token_ids_logprobs,
                  batch_next_token_ids,
@@ -531,7 +629,7 @@ diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/samp
              )
              logprob_result.write_output_to(logits_output)
  
-@@ -239,11 +396,13 @@
+@@ -239,11 +413,13 @@ class Sampler(nn.Module):
          Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
          """
          if simple_sampling_case:
@@ -550,7 +648,7 @@ diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/samp
          else:
              backend = get_server_args().sampling_backend
              if backend == "flashinfer":
-@@ -430,7 +589,11 @@
+@@ -430,7 +606,11 @@ class Sampler(nn.Module):
                      probabilities, sampling_info.sampling_seed, positions
                  ).view(-1)
              else:
@@ -563,75 +661,11 @@ diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/samp
              return batch_next_token_ids.to(torch.int32)
          else:
              assert (
-diff --git a/python/sglang/srt/layers/logprob_processor.py b/python/sglang/srt/layers/logprob_processor.py
---- a/python/sglang/srt/layers/logprob_processor.py
-+++ b/python/sglang/srt/layers/logprob_processor.py
-@@ -673,16 +673,31 @@
-         top_logprobs_nums: List[int],
-         token_ids_logprobs: List[List[int]],
-         batch_next_token_ids: torch.Tensor,
-+        logprobs_are_probs: bool,
-     ) -> LogprobResult:
--        # clamp to avoid -inf values
--        logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
-+        # Clamp the extracted values instead of the full [batch, vocab]
-+        # matrix. clamp(min=const) is elementwise and monotone
-+        # non-decreasing, so it commutes with topk/gather: clamping the
-+        # small outputs gives identical results (-inf -> finfo.min) while
-+        # skipping a full-matrix read+write pass (~0.4 ms/step on NPU).
-+        clamp_min = torch.finfo(logprobs.dtype).min
- 
-         result = LogprobResult()
-         if any(x > 0 for x in top_logprobs_nums):
--            (
--                result.top_logprobs_val,
--                result.top_logprobs_idx,
--            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
-+            # Same extraction as get_top_logprobs, but clamp the
-+            # [batch, max_k] topk result in a single kernel before
-+            # slicing per request.
-+            max_k = max(top_logprobs_nums)
-+            top_vals, top_idx = logprobs.topk(max_k, dim=-1)
-+            if logprobs_are_probs:
-+                top_vals.log_()
-+            top_vals.clamp_(min=clamp_min)
-+            result.top_logprobs_val = [
-+                top_vals[i][:k] for i, k in enumerate(top_logprobs_nums)
-+            ]
-+            result.top_logprobs_idx = [
-+                top_idx[i][:k] for i, k in enumerate(top_logprobs_nums)
-+            ]
- 
-         if any(x is not None for x in token_ids_logprobs):
-             (
-@@ -691,11 +706,19 @@
-             ) = get_token_ids_logprobs(
-                 logprobs, token_ids_logprobs, no_copy_to_cpu=True
-             )
-+            for row in result.token_ids_logprobs_val:
-+                if torch.is_tensor(row):
-+                    if logprobs_are_probs:
-+                        row.log_()
-+                    row.clamp_(min=clamp_min)
- 
--        result.token_logprobs = logprobs[
--            torch.arange(len(batch_next_token_ids), device=batch_next_token_ids.device),
--            batch_next_token_ids,
--        ]
-+        # Gather one value per row directly; this removes the temporary arange
-+        # and the 2-D advanced-index operation from the hot path.
-+        token_indices = batch_next_token_ids.to(dtype=torch.long).view(-1, 1)
-+        next_token_logprobs = torch.gather(logprobs, dim=1, index=token_indices).view(-1)
-+        if logprobs_are_probs:
-+            next_token_logprobs.log_()
-+        result.token_logprobs = next_token_logprobs.clamp_(min=clamp_min)
-         return result
- 
-     def compute_logprobs_only(
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 6d09e81332..1b51c5171c 100644
 --- a/python/sglang/srt/managers/tp_worker.py
 +++ b/python/sglang/srt/managers/tp_worker.py
-@@ -526,6 +526,34 @@
+@@ -526,6 +526,34 @@ class TpModelWorker(BaseTpWorker):
              can_run_cuda_graph=can_run_cuda_graph,
          )
  
@@ -666,7 +700,7 @@ diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/manager
      def forward_batch_generation(
          self,
          batch: Optional[ScheduleBatch],
-@@ -561,6 +589,7 @@
+@@ -561,6 +589,7 @@ class TpModelWorker(BaseTpWorker):
              return self._forward_batch_generation_dllm(forward_batch, batch)
  
          if self.pp_group.is_last_rank:

@@ -2,10 +2,7 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3-4B 4xGPU fully async training script.
-#
-# Usage:
-#   NUM_GPUS=4 bash scripts/training/text/run-qwen3-4B-4xgpu-async.sh
+# Qwen3.5-35B 16xNPU training script.
 
 set -ex
 set -o pipefail
@@ -35,7 +32,13 @@ export TORCH_HCCL_ZERO_COPY=1
 export MULTI_STREAM_MEMORY_REUSE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 
+export ASCEND_USE_FIA=1
+export GDN_ATTN_BACKEND_TRITON=0
+export STREAMS_PER_DEVICE=32
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
 export SGLANG_NPU_USE_MULTI_STREAM=1
+export SGLANG_NPU_ASYNC_EXPONENTIAL=1
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
@@ -95,10 +98,10 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
       # --recompute-granularity full
       # --recompute-method uniform
       # --recompute-num-layers 2
-      # --use-dynamic-batch-size
+      --use-dynamic-batch-size
       # Packing is not supported for GDN currently
-      --qkv-format bshd
-      --micro-batch-size 1
+      --qkv-format thd
+      # --micro-batch-size 1
       --max-tokens-per-gpu 20480
       --no-rope-fusion
       --no-gradient-accumulation-fusion
@@ -132,18 +135,28 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
    )
 
    SGLANG_ARGS=(
-      --rollout-num-gpus-per-engine 8
-      --sglang-mem-fraction-static 0.3
-      --sglang-max-running-requests 132
-      --sglang-cuda-graph-bs 4 8 16 32 64 128
-      --sglang-device npu
-      # --sglang-disable-radix-cache
-      --mamba-scheduler-strategy extra_buffer
-      --sglang-chunked-prefill-size 8192
-      --sglang-max-prefill-tokens 8192
-      --sglang-enable-dp-attention
-      --sglang-enable-dp-lm-head
-      --sglang-attention-backend ascend
+   --rollout-num-gpus-per-engine 4
+   --sglang-mem-fraction-static 0.85
+   --sglang-max-running-requests 128
+   --sglang-cuda-graph-bs 2 8 16 24 32 64 128
+   --sglang-device npu
+
+   --sglang-chunked-prefill-size 8192
+   --sglang-max-prefill-tokens 8192
+   --sglang-enable-dp-attention
+
+   --sglang-pp-size 1
+
+   --sglang-dp-size 1
+   --sglang-enable-dp-attention
+   --sglang-enable-dp-lm-head
+   --sglang-attention-backend ascend
+
+   --sglang-mamba-ssm-dtype bfloat16
+   --sglang-mamba-scheduler-strategy extra_buffer
+   --sglang-max-mamba-cache-size 192
+
+   --sglang-ep-size 1
    )
 
    MISC_ARGS=(
