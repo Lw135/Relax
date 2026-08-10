@@ -91,7 +91,7 @@ EVAL_ARGS=(
 )
 
 PERF_ARGS=(
-    --tensor-model-parallel-sze 4
+    --tensor-model-parallel-size 4
     --sequence-parallel
     --pipeline-model-parallel-size 1
     --context-parallel-size 1
