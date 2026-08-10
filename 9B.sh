@@ -35,7 +35,13 @@ export TORCH_HCCL_ZERO_COPY=1
 export MULTI_STREAM_MEMORY_REUSE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 
+export ASCEND_USE_FIA=1
+export GDN_ATTN_BACKEND_TRITON=0
+export STREAMS_PER_DEVICE=32
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
 export SGLANG_NPU_USE_MULTI_STREAM=1
+export SGLANG_NPU_ASYNC_EXPONENTIAL=1
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
@@ -49,14 +55,14 @@ PROJECT_NAME="${PROJECT_NAME:=Relax/dev/dapo-math}"
 NUM_ROLLOUT="${NUM_ROLLOUT:=3000}"
 
 CKPT_ARGS=(
-    --hf-checkpoint /home/weights/Qwen3.5-9B
-    --ref-load /home/weights/Qwen3.5-9B
+    --hf-checkpoint Qwen3.5-9B
+    --ref-load Qwen3.5-9B
     --megatron-to-hf-mode bridge
-    --save /home/weights/Qwen3.5-9B-save-lyw
+    --save Qwen3.5-9B-save
     --save-interval 100
 )
 
-PROMPT_SET=/home/l30055792/datasets/dapo-math-17k.jsonl
+PROMPT_SET=dapo-math-17k.jsonl
 ROLLOUT_ARGS=(
     --prompt-data ${PROMPT_SET}
     --input-key prompt
@@ -78,7 +84,7 @@ EVAL_ARGS=(
     --log-passrate
     --eval-interval 20
     --skip-eval-before-train
-    --eval-prompt-data aime /home/l30055792/datasets/aime-2024.jsonl
+    --eval-prompt-data aime aime-2024.jsonl
     --n-samples-per-eval-prompt 8
     --eval-max-response-len 8192
     #--eval-top-p 0.7
@@ -87,17 +93,17 @@ EVAL_ARGS=(
 PERF_ARGS=(
     --tensor-model-parallel-sze 4
     --sequence-parallel
-    --pipeline-model-parallel-size 2
+    --pipeline-model-parallel-size 1
     --context-parallel-size 1
     --expert-model-parallel-size 1
     --expert-tensor-parallel-size 1
     # --recompute-granularity full
     # --recompute-method uniform
     # --recompute-num-layers 2
-    # --use-dynamic-batch-size
+    --use-dynamic-batch-size
     # Packing is not supported for GDN currently
-    --qkv-format bshd
-    --micro-batch-size 1
+    --qkv-format thd
+    # --micro-batch-size 1
     --max-tokens-per-gpu 10240
     --no-rope-fusion
     --no-gradient-accumulation-fusion
@@ -122,28 +128,36 @@ OPTIMIZER_ARGS=(
     --weight-decay 0.1
     --adam-beta1 0.9
     --adam-beta2 0.98
-    --optimizer-cpu-offload
-    --overlap-cpu-optimizer-d2h-h2d
-    --use-precision-aware-optimizer
+    # --optimizer-cpu-offload
+    # --overlap-cpu-optimizer-d2h-h2d
+    # --use-precision-aware-optimizer
     --use-distributed-optimizer
     --overlap-grad-reduce
     --overlap-param-gather
 )
 
 SGLANG_ARGS=(
-    --rollout-num-gpus-per-engine 4
-    --sglang-mem-fraction-static 0.8
-    --sglang-max-running-requests 256
-    --sglang-cuda-graph-bs 4 8 16 32 64 128 192 256
-    --sglang-device npu
-    # --sglang-disable-radix-cache
-    --mamba-scheduler-strategy extra_buffer
-    --sglang-chunked-prefill-size 8192
-    --sglang-max-prefill-tokens 8192
-    --sglang-enable-dp-attention
-    --sglang-enable-dp-lm-head
-    --sglang-attention-backend ascend
-)
+   --rollout-num-gpus-per-engine 4
+   --sglang-mem-fraction-static 0.7
+   --sglang-max-running-requests 256
+   --sglang-cuda-graph-bs 2 8 16 24 32 64 128 192 256
+   --sglang-device npu
+
+   --sglang-chunked-prefill-size 8192
+   --sglang-max-prefill-tokens 8192
+   --sglang-enable-dp-attention
+
+   --sglang-pp-size 1
+   --sglang-dp-size 1
+   --sglang-ep-size 1
+
+   --sglang-enable-dp-attention
+   --sglang-enable-dp-lm-head
+   --sglang-attention-backend ascend
+   --sglang-mamba-ssm-dtype bfloat16
+   --sglang-mamba-scheduler-strategy extra_buffer
+   --sglang-max-mamba-cache-size 192
+   )
 
 MISC_ARGS=(
     # default dropout in megatron is 0.1
@@ -155,13 +169,6 @@ MISC_ARGS=(
     # need to comment this when using model with MLA
     --attention-backend flash
     --use-flash-attn
-)
-
-PARTIAL_ROLLOUT_ARGS=(
-    --partial-rollout
-    --over-sampling-batch-size 48
-    --mask-offpolicy-in-partial-rollout
-    --partial-rollout-max-aborted-count 3
 )
 
 mkdir -p log
@@ -184,4 +191,4 @@ mkdir -p log
     "${PERF_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}" 2>&1 | tee log/qwen35-35B-gpu8-sync-bshd-nnode1.log
+    "${MISC_ARGS[@]}" 2>&1 | tee log/qwen35-35B-gpu8-sync-thd.log

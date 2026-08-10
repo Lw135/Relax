@@ -197,7 +197,7 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
       "${PERF_ARGS[@]}" \
       "${EVAL_ARGS[@]}" \
       "${SGLANG_ARGS[@]}" \
-      "${MISC_ARGS[@]}" 2>&1 | tee log/qwen35-35B-gpu16-sync-bshd-nnode2.log
+      "${MISC_ARGS[@]}" 2>&1 | tee log/qwen35-35B-gpu16-sync-thd-nnode2.log
 else
    echo "wiil not get here"
 fi
