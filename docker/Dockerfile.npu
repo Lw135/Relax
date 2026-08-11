@@ -71,7 +71,7 @@ RUN pip install pyyaml && \
     pip install dist/torch_npu*.whl
 
 # install triton/TQ
-RUN pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple && \
+RUN pip install triton-ascend==3.2.1 --extra-index-url=https://triton-ascend.osinfra.cn/pypi/simple --trusted-host triton-ascend.osinfra.cn && \
     pip install tensordict==0.10.0 pyvers==0.1.0 --no-deps && \
     pip install "transferqueue @ git+https://github.com/redai-infra/TransferQueue.git@58054a33834aadbcf76aacd6b1e32e25c030f2c9" --no-deps
 
