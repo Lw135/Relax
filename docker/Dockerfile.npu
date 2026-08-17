@@ -124,7 +124,7 @@ RUN mkdir cann-custom-ops && \
 RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil && \
     git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu && \
     cd /root/sgl-kernel-npu && git checkout 2026.7.2 && \
-    patch -p1 < /root/Relax/docker/npu_patch/torch-memory-saver.patch  && \
+    patch -p1 < /root/Relax/docker/npu_patch/sgl-kernel-npu.patch  && \
     bash build.sh -a kernels && bash build.sh -a memory-saver && bash build.sh -a deepep && \
     pip install output/*.whl && \
     cd "$(pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so && \
@@ -156,19 +156,6 @@ RUN cd /root/MindSpeed && \
     cd /sgl-workspace/sglang && \
     patch -p1 < /root/Relax/docker/npu_patch/sglang-npu.patch
 
-# Patch torch_memory_saver
-# RUN 
-#     sed -i '164a\**kwargs' /usr/local/python3.11.15/lib/python3.11/site-packages/torch_memory_saver/entrypoint.py      
-#     sed -i '164a\            torch.npu.empty_cache()' /usr/local/python3.11.15/lib/python3.11/site-packages/torch_memory_saver/entrypoint.py
-
-# Install sgl-kernle-npu
-# RUN git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu && \
-#     cd /root/sgl-kernel-npu && git checkout 2026.07.02 && \
-#     patch -p1 < /root/Relax/docker/npu_patch/torch-memory-saver.patch  && \
-#     bash build.sh -a kernels && bash build.sh -a memory-saver && \
-#     pip install output/*.whl && \
-#     cd /root && rm -rf /root/sgl-kernel-npu 
-
 # Copy MindSpeed-Bridge, Megatron-Bridge into Megatron-LM
 RUN cp -r /root/MindSpeed-Bridge/mindspeed_bridge /root/Megatron-LM/ && \
     cp -r /root/Megatron-Bridge/src/megatron/bridge /root/Megatron-LM/megatron/ && \
@@ -176,7 +163,7 @@ RUN cp -r /root/MindSpeed-Bridge/mindspeed_bridge /root/Megatron-LM/ && \
 
 RUN cd /root/Relax && pip install -e .
 
-RUN ${PIP_INSTALL} ray==2.55.1 protobuf==6.33.6 torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} transformers==5.12.1 fastapi==0.139.1
+RUN ${PIP_INSTALL} ray==2.55.1 protobuf==6.33.6 torch==${PYTORCH_VERSION} torchvision==${TORCHVISION_VERSION} transformers==5.12.1 fastapi==0.139.1 fastokens==0.3.1
 
 RUN cd /root && \
     git clone https://gitcode.com/Ascend/pytorch.git && \

@@ -1,3 +1,483 @@
+diff --git a/python/sglang/kernels/ops/attention/full_attention_fusion_npu.py b/python/sglang/kernels/ops/attention/full_attention_fusion_npu.py
+new file mode 100644
+index 0000000000..c07c3fc96e
+--- /dev/null
++++ b/python/sglang/kernels/ops/attention/full_attention_fusion_npu.py
+@@ -0,0 +1,461 @@
++# Qwen3.5-35B-A3B NPU decode 全注意力段融合 kernel（full_attention 优化点 A1b/A2/A3a）。
++#
++# 内容与收益（图内 UT，资产 resource/code/full_attention/，
++# 裁决见 docs/practice/npu-qwen35-full-attn-decode-fusion-opt.md）：
++#   A1b split_qkvgate_v4_scatter：split q/gate/k/v + q/k gemma rmsnorm + rope
++#       单 kernel，且 k/v 按 loc 直接 scatter 进 KV cache（替代 stock
++#       split_qkvgate_gemma_rmsnorm_rope 13.5us + 2x npu_scatter_nd_update_ 29us，
++#       一体 5.32us）；返回的 k/v 为 None（cache 已写，调用方须跳过 set_kv_buffer）。
++#   A2  fa_sigmoid_mul：sigmoid(gate)*attn 融合单 kernel（替代 sigmoid+mul_ 两
++#       kernel，3.34→2.29us）；bitwise 模式先舍 bf16 再乘，与 stock 逐位一致。
++#   A3a fa_add_gemma_rms_norm_v2：grid=(batch,) 行并行（stock 按核数开），
++#       5.30→4.01us；数学与 stock add_gemma_rms_norm 完全一致。
++#
++# 精度：三个 kernel 在图内 UT 均 bitwise=1.0（bf16 按 int16 逐位对比 stock）。
++# 数值约定与 sgl_kernel_npu stock 逐字一致：fp32 中间精度、gemma (w+1)、
++# neox rotate_half rope（cat=[-x2,x1]; out=cat*sin+rot*cos）。
++#
++# 安全网：每个调用点先过守卫（精确命中已验证形状才走自研 kernel，否则回退
++# stock）；环境变量 SGLANG_NPU_FULL_ATTN_FUSION=0 可整体关停（图模式下守卫
++# 判定在 capture 时烘进图，需在建图前设置）。
++#
++# 定位日志：SGLANG_NPU_FULL_ATTN_FUSION_DEBUG=1 时，A1b 守卫按层一次性打印
++# 「未命中原因」或「已激活」确认（服务器上确认 A1b 是否生效/卡在哪一环用）。
++#
++# ⚠️ triton-ascend 约束（GMM2 黑名单 + full_attention v2/v3 两轮实证）：
++# 不要按 program_id 做运行时段选择、不要用标量条件 mask store、不要 2D masked
++# store——v2/v3 均因此误编译。本文件全部 kernel 只用已实证构造子集：
++# 纯线性索引 + 每 program 固定职责 + 1D 无掩码 store + constexpr if。
++
++import logging
++import os
++
++import torch
++import triton
++import triton.language as tl
++import triton.language.extra.cann.extension as al
++
++logger = logging.getLogger(__name__)
++
++_FA_FUSION_ENV = "SGLANG_NPU_FULL_ATTN_FUSION"
++_FA_DEBUG_ENV = "SGLANG_NPU_FULL_ATTN_FUSION_DEBUG"
++_fa_debug_logged = set()
++
++
++def fa_fusion_enabled() -> bool:
++    """full_attention 融合总开关（默认开；=0 时全部回退 stock）。"""
++    return os.environ.get(_FA_FUSION_ENV, "1") == "1"
++
++
++def _fa_debug_log(key, msg):
++    """debug 开关打开时按 key 一次性打日志（定位守卫未命中环节用）。"""
++    if os.environ.get(_FA_DEBUG_ENV, "0") != "1":
++        return
++    if key in _fa_debug_logged:
++        return
++    _fa_debug_logged.add(key)
++    logger.warning("[full_attention_fusion] %s", msg)
++
++
++# ---------------------------------------------------------------------------
++# A3a：add_gemma_rms_norm 行并行版（grid=(batch,)，每 program 一整行）
++# 数学与 stock add_gemma_rms_norm 完全一致（bf16 加残差→fp32 归约→fp32 (w+1)）。
++# P1 已实证 bitwise=1.0、1.32x。
++# ---------------------------------------------------------------------------
++@triton.jit
++def add_gemma_rms_norm_v2_kernel(
++    x_ptr,
++    res_ptr,
++    w_ptr,
++    add_out_ptr,
++    norm_out_ptr,
++    eps,
++    DIM: tl.constexpr,
++):
++    row = tl.program_id(0)
++    cols = tl.arange(0, DIM)
++    x = tl.load(x_ptr + row * DIM + cols)
++    r = tl.load(res_ptr + row * DIM + cols)
++    add = x + r
++    tl.store(add_out_ptr + row * DIM + cols, add)
++    xf = add.to(tl.float32)
++    w = tl.load(w_ptr + cols).to(tl.float32) + 1.0
++    var = tl.sum(xf * xf) / DIM
++    out = xf * tl.rsqrt(var + eps) * w
++    tl.store(norm_out_ptr + row * DIM + cols, out.to(x_ptr.dtype.element_ty))
++
++
++def fa_add_gemma_rms_norm_v2_supported(x, residual) -> bool:
++    """A3a 形状守卫：2D、bf16、连续、hidden 为 2 的幂（UT 验证口径 [32,2048]，
++    kernel 对任意 batch 行数逐位等价；hidden 非 2 的幂时 tl.arange 不合法）。"""
++    if not fa_fusion_enabled():
++        return False
++    if residual is None or x.dim() != 2:
++        return False
++    if x.dtype != torch.bfloat16 or residual.dtype != torch.bfloat16:
++        return False
++    if not (x.is_contiguous() and residual.is_contiguous()):
++        return False
++    dim = x.shape[-1]
++    return dim > 0 and (dim & (dim - 1)) == 0
++
++
++def fa_add_gemma_rms_norm_v2(x, weight, residual, eps):
++    """返回 (norm_out, add_out)，语义同 sgl_kernel_npu add_gemma_rms_norm。
++    调用前须过 fa_add_gemma_rms_norm_v2_supported。"""
++    add_out = torch.empty_like(x)
++    norm_out = torch.empty_like(x)
++    B, D = x.shape
++    add_gemma_rms_norm_v2_kernel[(B,)](
++        x, residual, weight, add_out, norm_out, eps, DIM=D
++    )
++    return norm_out, add_out
++
++
++# ---------------------------------------------------------------------------
++# A2：sigmoid(gate) * attn 融合（替代 torch.sigmoid + mul_ 两个 kernel）
++# ---------------------------------------------------------------------------
++@triton.jit
++def sigmoid_mul_kernel(
++    attn_ptr,
++    gate_ptr,
++    out_ptr,
++    numel,
++    BLOCK: tl.constexpr,
++    BITWISE: tl.constexpr,
++):
++    pid = tl.program_id(0)
++    offs = pid * BLOCK + tl.arange(0, BLOCK)
++    mask = offs < numel
++    a = tl.load(attn_ptr + offs, mask=mask).to(tl.float32)
++    g = tl.load(gate_ptr + offs, mask=mask).to(tl.float32)
++    s = tl.sigmoid(g)
++    if BITWISE:
++        # 模拟 stock 两个 op 之间的 bf16 中间舍入：sigmoid 先舍到 bf16 再乘，
++        # 与 attn.mul_(torch.sigmoid(gate)) 目标逐位一致（P4 已实证 bitwise=1.0）。
++        s = s.to(tl.bfloat16).to(tl.float32)
++    out = (a * s).to(tl.bfloat16)
++    tl.store(out_ptr + offs, out, mask=mask)
++
++
++def fa_sigmoid_mul_supported(attn_output, gate) -> bool:
++    """A2 形状守卫：等形、bf16、连续（elementwise 融合，无形状特化）。"""
++    if not fa_fusion_enabled():
++        return False
++    if attn_output.dtype != torch.bfloat16 or gate.dtype != torch.bfloat16:
++        return False
++    if attn_output.shape != gate.shape:
++        return False
++    return attn_output.is_contiguous() and gate.is_contiguous()
++
++
++def fa_sigmoid_mul(attn, gate):
++    """out = attn * sigmoid(gate)，与 stock 双 op 舍入路径逐位一致。
++    调用前须过 fa_sigmoid_mul_supported。"""
++    out = torch.empty_like(attn)
++    numel = attn.numel()
++    BLOCK = 512
++    sigmoid_mul_kernel[(triton.cdiv(numel, BLOCK),)](
++        attn, gate, out, numel, BLOCK=BLOCK, BITWISE=True
++    )
++    return out
++
++
++# ---------------------------------------------------------------------------
++# A1b（v4，行并行直线版）：split q/kv/gate + q/k gemma rmsnorm + rope，
++# 且 k/v 按 loc 直接 scatter 进 KV cache（免中间张量与两次 scatter_nd_update）。
++# grid=(batch,)：一 program 一行，q+gate / k / v 三段在一条直线里顺序做完。
++# 设计约束（v2/v3 失败教训）：pid 只做线性索引（不取整除/取模）、段间无运行时
++# 选择、store 不带标量条件 mask；SCATTER_KV 为 constexpr 分支，本文件生产
++# wrapper 恒 =1，k/v 中间张量写出整段编译期消除。
++# TP8 shape 特化：NUM_Q_HEADS=2, NUM_KV_HEADS=1。
++# ---------------------------------------------------------------------------
++@triton.jit
++def split_qkvgate_v4_kernel(
++    input_ptr,
++    sin_ptr,
++    cos_ptr,
++    q_ptr,
++    gate_ptr,
++    k_ptr,
++    v_ptr,
++    kbuf_ptr,
++    vbuf_ptr,
++    loc_ptr,
++    q_weight_ptr,
++    k_weight_ptr,
++    q_hidden_size: tl.constexpr,
++    kv_hidden_size: tl.constexpr,
++    total_hidden_size: tl.constexpr,
++    eps: tl.constexpr,
++    NUM_Q_HEADS: tl.constexpr,  # 2
++    HEAD_DIM: tl.constexpr,
++    ROPE_DIM: tl.constexpr,
++    HALF_ROPE_DIM: tl.constexpr,
++    SCATTER_KV: tl.constexpr,
++):
++    row = tl.program_id(0)
++    base = input_ptr + row * total_hidden_size
++    d = tl.arange(0, HEAD_DIM)
++
++    # ---- q+gate：qkv 行前 2*q_hidden_size 连续读入，reshape 成 (头数, 512) 后
++    # 逐头切出 [q(256) | gate(256)]（与 stock 的 extract_slice 切法完全一致）
++    qg_cols = tl.arange(0, 2 * NUM_Q_HEADS * HEAD_DIM)
++    qg = tl.load(base + qg_cols).to(tl.float32).reshape(
++        NUM_Q_HEADS, 2 * HEAD_DIM
++    )
++    q = al.extract_slice(
++        qg, offsets=(0, 0), sizes=(NUM_Q_HEADS, HEAD_DIM), strides=(1, 1)
++    )
++    gate = al.extract_slice(
++        qg, offsets=(0, HEAD_DIM), sizes=(NUM_Q_HEADS, HEAD_DIM), strides=(1, 1)
++    )
++
++    # q norm（fp32 中间、gemma w+1；运算顺序与 stock 逐字一致）
++    qw = tl.load(q_weight_ptr + d).to(tl.float32) + 1.0
++    qvar = tl.sum(q * q, axis=1) / HEAD_DIM
++    qn = q * tl.rsqrt(qvar + eps)[:, None] * qw[None, :]
++
++    # rope（neox rotate_half，仅前 ROPE_DIM 维；与 v3 已实证块逐字一致）
++    sc = row * ROPE_DIM + tl.arange(0, ROPE_DIM)
++    sin = tl.load(sin_ptr + sc).to(tl.float32).reshape(1, ROPE_DIM)
++    cos = tl.load(cos_ptr + sc).to(tl.float32).reshape(1, ROPE_DIM)
++    rot = al.extract_slice(
++        qn, offsets=(0, 0), sizes=(NUM_Q_HEADS, ROPE_DIM), strides=(1, 1)
++    )
++    x1 = al.extract_slice(
++        rot, offsets=(0, 0), sizes=(NUM_Q_HEADS, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    x2 = al.extract_slice(
++        rot, offsets=(0, HALF_ROPE_DIM), sizes=(NUM_Q_HEADS, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    cat = tl.zeros((NUM_Q_HEADS, ROPE_DIM), dtype=tl.float32)
++    cat = al.insert_slice(
++        cat, -x2, offsets=(0, 0), sizes=(NUM_Q_HEADS, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    cat = al.insert_slice(
++        cat, x1, offsets=(0, HALF_ROPE_DIM), sizes=(NUM_Q_HEADS, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    roped = cat * sin + rot * cos
++    qn = al.insert_slice(
++        qn, roped, offsets=(0, 0), sizes=(NUM_Q_HEADS, ROPE_DIM), strides=(1, 1)
++    )
++
++    # q/gate 写出：1D 无掩码 store（stock reshape(Q_BLOCK) 同款；2D masked store
++    # 是 v3 的嫌疑构造，v4 全避开）
++    qg_out = row * q_hidden_size + tl.arange(0, NUM_Q_HEADS * HEAD_DIM)
++    tl.store(
++        q_ptr + qg_out,
++        qn.reshape(NUM_Q_HEADS * HEAD_DIM).to(input_ptr.dtype.element_ty),
++    )
++    tl.store(
++        gate_ptr + qg_out,
++        gate.reshape(NUM_Q_HEADS * HEAD_DIM).to(input_ptr.dtype.element_ty),
++    )
++
++    # ---- k（1 头）：norm + rope，与 stock k 段的 (1, HEAD_DIM) 形态一致
++    kt = tl.load(base + 2 * q_hidden_size + d).to(tl.float32).reshape(1, HEAD_DIM)
++    kw = tl.load(k_weight_ptr + d).to(tl.float32) + 1.0
++    kvar = tl.sum(kt * kt, axis=1) / HEAD_DIM
++    kn = kt * tl.rsqrt(kvar + eps)[:, None] * kw[None, :]
++    krot = al.extract_slice(kn, offsets=(0, 0), sizes=(1, ROPE_DIM), strides=(1, 1))
++    kx1 = al.extract_slice(
++        krot, offsets=(0, 0), sizes=(1, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    kx2 = al.extract_slice(
++        krot, offsets=(0, HALF_ROPE_DIM), sizes=(1, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    kcat = tl.zeros((1, ROPE_DIM), dtype=tl.float32)
++    kcat = al.insert_slice(
++        kcat, -kx2, offsets=(0, 0), sizes=(1, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    kcat = al.insert_slice(
++        kcat, kx1, offsets=(0, HALF_ROPE_DIM), sizes=(1, HALF_ROPE_DIM), strides=(1, 1)
++    )
++    kroped = kcat * sin + krot * cos
++    kn = al.insert_slice(kn, kroped, offsets=(0, 0), sizes=(1, ROPE_DIM), strides=(1, 1))
++
++    # ---- v：bf16 原样拷贝（stock v 段不过 fp32）
++    vt = tl.load(base + 2 * q_hidden_size + kv_hidden_size + d)
++
++    # constexpr 分支（A2 BITWISE 同族实证）：SCATTER_KV=1 时 k/v 中间张量写出
++    # 整段编译期消除，k_ptr/v_ptr 占位指针不会被解引用
++    if SCATTER_KV:
++        slot = tl.load(loc_ptr + row).to(tl.int64)
++        tl.store(
++            kbuf_ptr + slot * kv_hidden_size + d,
++            kn.reshape(HEAD_DIM).to(input_ptr.dtype.element_ty),
++        )
++        tl.store(vbuf_ptr + slot * kv_hidden_size + d, vt)
++    else:
++        tl.store(
++            k_ptr + row * kv_hidden_size + d,
++            kn.reshape(HEAD_DIM).to(input_ptr.dtype.element_ty),
++        )
++        tl.store(v_ptr + row * kv_hidden_size + d, vt)
++
++
++def fa_split_qkvgate_scatter_supported(
++    num_heads, num_kv_heads, head_dim, rope_dim, attn_output_gate
++) -> bool:
++    """A1b 形状守卫（TP 布局特化，UT 验证口径）：每 rank q=2 头、kv=1 头、
++    head_dim=256、rope=64、带 attn_output_gate。其余 TP/模型配置回退 stock。"""
++    ok = (
++        fa_fusion_enabled()
++        and num_heads == 2
++        and num_kv_heads == 1
++        and head_dim == 256
++        and rope_dim == 64
++        and attn_output_gate
++    )
++    if not ok:
++        _fa_debug_log(
++            ("shape_guard",),
++            "A1b 形状守卫未命中（回退 stock）："
++            f"num_heads={num_heads}(需2) num_kv_heads={num_kv_heads}(需1) "
++            f"head_dim={head_dim}(需256) rope_dim={rope_dim}(需64) "
++            f"gate={attn_output_gate}(需True) "
++            f"{_FA_FUSION_ENV}={os.environ.get(_FA_FUSION_ENV, '1')!r}",
++        )
++    return ok
++
++
++def fa_kv_pool_buffers(layer_id):
++    """从当前 NPU attention backend 的 KV pool 取该层 k/v buffer。
++    仅在 use_fia 布局（[pages*page_size, 1, head_num, head_dim]，与 token 级
++    slot=loc 直写口径一致）且非 hybrid SWA 时返回 (kbuf, vbuf)，否则返回 None。
++
++    GDN 混合模型的 pool 是 HybridLinearKVPool 包装：use_fia 判定要读内层
++    full_kv_pool（NPUMHATokenToKVPool，外层无此属性）；取 buffer 走外层
++    get_key/value_buffer——外层按 full_attention_layer_id_mapping 把全局
++    layer_id 翻译成全注意力局部序号后再 delegate（内层 pool 只有全注意力层，
++    直接用全局 id 会取错层）。
++    """
++    from sglang.srt.model_executor.forward_context import get_attn_backend
++
++    backend = get_attn_backend()
++    if getattr(backend, "is_hybrid_swa", False):
++        _fa_debug_log(
++            ("pool_swa", layer_id),
++            f"layer {layer_id}: backend is_hybrid_swa=True，A1b 回退 stock",
++        )
++        return None
++    pool = getattr(backend, "token_to_kv_pool", None)
++    if pool is None:
++        _fa_debug_log(
++            ("pool_none", layer_id),
++            f"layer {layer_id}: backend {type(backend).__name__} 无 "
++            "token_to_kv_pool，A1b 回退 stock",
++        )
++        return None
++    inner = getattr(pool, "full_kv_pool", pool)
++    if not getattr(inner, "use_fia", False):
++        _fa_debug_log(
++            ("pool_fia", layer_id),
++            f"layer {layer_id}: pool {type(pool).__name__} 内层 "
++            f"{type(inner).__name__}.use_fia=False（ASCEND_USE_FIA 未开？），"
++            "A1b 回退 stock",
++        )
++        return None
++    return pool.get_key_buffer(layer_id), pool.get_value_buffer(layer_id)
++
++
++def fa_v4_scatter_context(layer, forward_batch, qkv):
++    """A1b 运行时守卫总入口：全部条件命中返回 (kbuf, vbuf, loc)，任一未命中
++    返回 None（调用方回退 stock split + stock set_kv_buffer，行为与 origin
++    完全一致）。DEBUG=1 时按层一次性打印未命中原因/激活确认。"""
++    layer_id = layer.attn.layer_id
++    if not getattr(layer, "_fa_v4_shape_ok", False):
++        _fa_debug_log(
++            ("shape", layer_id),
++            f"layer {layer_id}: _fa_v4_shape_ok=False（见 init 时形状守卫日志），"
++            "A1b 回退 stock",
++        )
++        return None
++    if not forward_batch.forward_mode.is_decode():
++        _fa_debug_log(
++            ("mode", layer_id),
++            f"layer {layer_id}: forward_mode={forward_batch.forward_mode} 非 "
++            "DECODE（MTP verify / mixed / prefill 均不走 A1b），回退 stock",
++        )
++        return None
++    if not torch.is_tensor(qkv) or qkv.dtype != torch.bfloat16 or not qkv.is_contiguous():
++        _fa_debug_log(
++            ("qkv", layer_id),
++            f"layer {layer_id}: qkv 不满足（tensor={torch.is_tensor(qkv)} "
++            f"dtype={getattr(qkv, 'dtype', None)} "
++            f"contiguous={qkv.is_contiguous() if torch.is_tensor(qkv) else None}），"
++            "A1b 回退 stock",
++        )
++        return None
++    kv_bufs = fa_kv_pool_buffers(layer_id)
++    if kv_bufs is None:
++        return None  # 具体原因已在 fa_kv_pool_buffers 内打日志
++    kbuf, vbuf = kv_bufs
++    if kbuf.dtype != qkv.dtype:
++        _fa_debug_log(
++            ("kvdtype", layer_id),
++            f"layer {layer_id}: KV cache dtype={kbuf.dtype} != qkv "
++            f"dtype={qkv.dtype}（如 fp8 KV cache），A1b 回退 stock",
++        )
++        return None
++    _fa_debug_log(
++        ("active", layer_id),
++        f"layer {layer_id}: A1b 融合 split+KV scatter 已激活",
++    )
++    return kbuf, vbuf, forward_batch.out_cache_loc
++
++
++def fa_split_qkvgate_scatter(
++    input,
++    sin,
++    cos,
++    q_hidden_size,
++    kv_hidden_size,
++    head_dim,
++    rope_dim,
++    eps,
++    q_weight,
++    k_weight,
++    kbuf,
++    vbuf,
++    loc,
++):
++    """stock split_qkvgate_gemma_rmsnorm_rope 的行并行直线版（grid=(batch,)），
++    k/v 不写中间张量、按 loc 直接 scatter 进 KV cache。
++    返回 (q, None, None, gate)：k/v 为 None 表示 cache 已写，
++    调用方须以 save_kv_cache=False 走 attention backend。
++    仅支持 q=2 头、kv=1 头（TP8 shape 特化），调用前须过
++    fa_v4_scatter_context 守卫。"""
++    batch = input.shape[0]
++    num_q = q_hidden_size // head_dim
++    num_kv = kv_hidden_size // head_dim
++    assert num_q == 2 and num_kv == 1, "v4 为 TP8 shape 特化（q=2 头, kv=1 头）"
++    assert kbuf.dtype == input.dtype and vbuf.dtype == input.dtype
++    q_out = torch.empty(batch, q_hidden_size, device=input.device, dtype=input.dtype)
++    gate_out = torch.empty(batch, q_hidden_size, device=input.device, dtype=input.dtype)
++    # SCATTER_KV=1：k_ptr/v_ptr 为占位指针（q_out/gate_out），编译期消除不会被写
++    split_qkvgate_v4_kernel[(batch,)](
++        input,
++        sin,
++        cos,
++        q_out,
++        gate_out,
++        q_out,
++        gate_out,
++        kbuf,
++        vbuf,
++        loc,
++        q_weight,
++        k_weight,
++        q_hidden_size,
++        kv_hidden_size,
++        q_hidden_size * 2 + kv_hidden_size * 2,
++        eps,
++        NUM_Q_HEADS=2,
++        HEAD_DIM=head_dim,
++        ROPE_DIM=rope_dim,
++        HALF_ROPE_DIM=rope_dim // 2,
++        SCATTER_KV=True,
++    )
++    return q_out, None, None, gate_out
+diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
+index 51c85e6302..2915342175 100644
+--- a/python/sglang/srt/entrypoints/http_server.py
++++ b/python/sglang/srt/entrypoints/http_server.py
+@@ -636,7 +636,7 @@ async def health_generate(request: Request) -> Response:
+     ):
+         return Response(status_code=200)
+ 
+-    sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
++    sampling_params = {"max_new_tokens": 1, "temperature": 1.0, "top_k":-1, "top_p":1.0}
+     # uuid keeps rids unique across tokenizer workers (a bare time.time() can
+     # collide and crash the shared DetokenizerManager decode_status).
+     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
 diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
 index 7e63f30525..cc9510ff95 100644
 --- a/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
@@ -135,6 +615,524 @@ index 7e63f30525..cc9510ff95 100644
          if is_target_verify:
              g, beta = fused_gdn_gating_kernel_without_sigmoid(
                  layer.A_log, a, b, layer.dt_bias
+diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
+index a0339d8fb9..c8f1625247 100644
+--- a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
+@@ -38,6 +38,22 @@ if TYPE_CHECKING:
+     )
+ 
+ 
++@contextmanager
++def _disable_tms_during_graph_capture():
++    try:
++        from torch_memory_saver import torch_memory_saver
++        _impl = torch_memory_saver._impl
++    except Exception:
++        _impl = None
++
++    if _impl is not None:
++        _impl._binary_wrapper.cdll.tms_set_interesting_region(False)
++    try:
++        yield
++    finally:
++        if _impl is not None:
++            _impl._binary_wrapper.cdll.tms_set_interesting_region(True)
++
+ class NPUCudaGraphBackend(BaseCudaGraphBackend):
+     """One torch.npu.NPUGraph per shape; attention metadata captured
+     inside the graph. replay_with_input_update substitutes fresh
+@@ -120,7 +136,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
+                 auto_dispatch_capture=True,
+             ),
+         ):
+-            out = forward_fn()
++            with _disable_tms_during_graph_capture():
++                out = forward_fn()
+ 
+         self._graphs[shape_key] = graph
+         self._outputs[shape_key] = out
+diff --git a/python/sglang/srt/hardware_backend/npu/moe/init_routing.py b/python/sglang/srt/hardware_backend/npu/moe/init_routing.py
+index bce2acf19a..dd45ea6f01 100644
+--- a/python/sglang/srt/hardware_backend/npu/moe/init_routing.py
++++ b/python/sglang/srt/hardware_backend/npu/moe/init_routing.py
+@@ -127,3 +127,64 @@ class NPUMoEInitRouting_Quant(BaseInitRouting):
+         )
+         expert_tokens = expert_tokens.to(torch.int64)
+         return hidden_states, expanded_row_idx, expert_tokens, pertoken_scale
++
++
++class NPUMoEInitRouting_v22(BaseInitRouting):
++    """
++    v2.2 自写 init routing（moe_front_fusion/v1，六轮单测 0 容差逐位验收）。
++
++    走 ``sgl_kernel_npu.moe.moe_front_routing.moe_init_routing_v22``（Triton
++    rank_hist + partials_cumsum + gather 三 launch），语义与
++    ``npu_moe_init_routing_v2(type=1)`` 逐位一致，并原生产出 exclusive
++    offsets（int32，``self.last_expert_offsets``）供 persistent GMM2
++    ``offsets=`` 直用（省 _gmm2_offsets_kernel ~4.4µs/层）。
++
++    仅支持 BF16 无量化路径（pertoken_scale=None）；形态门（decode 尺寸
++    M=T*top_k ≤512 且 M%8==0、H 为 2 的幂、bf16）之外回退 stock v2 实现。
++    """
++
++    def __init__(self):
++        self.last_expert_offsets: Optional[torch.Tensor] = None
++
++    def _init_routing(
++        self,
++        hidden_states: torch.Tensor,
++        topk_ids: torch.Tensor,
++        num_experts: int,
++        top_k: int,
++    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
++        self.last_expert_offsets = None
++        num_tokens = hidden_states.shape[0]
++        m = num_tokens * top_k
++        h = hidden_states.shape[1]
++        if (
++            m <= 512
++            and m % 8 == 0
++            and (h & (h - 1)) == 0
++            and hidden_states.dtype == torch.bfloat16
++        ):
++            from sgl_kernel_npu.moe.moe_front_routing import moe_init_routing_v22
++
++            hidden_states, expanded_row_idx, expert_tokens, excl, _incl = (
++                moe_init_routing_v22(
++                    hidden_states, topk_ids, num_experts, top_k
++                )
++            )
++            self.last_expert_offsets = excl
++            return hidden_states, expanded_row_idx, expert_tokens, None
++
++        # 形态门外（prefill 大尺寸 / 非验证 dtype）：回退 stock v2。
++        hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
++            torch.ops.npu.npu_moe_init_routing_v2(
++                hidden_states,
++                topk_ids,
++                active_num=m,
++                expert_num=num_experts,
++                expert_tokens_num_type=1,
++                expert_tokens_num_flag=True,
++                active_expert_range=[0, num_experts],
++                quant_mode=-1,
++            )
++        )
++        expert_tokens = expert_tokens.to(torch.int64)
++        return hidden_states, expanded_row_idx, expert_tokens, None
+diff --git a/python/sglang/srt/hardware_backend/npu/moe/topk.py b/python/sglang/srt/hardware_backend/npu/moe/topk.py
+index d594980382..74330fda64 100644
+--- a/python/sglang/srt/hardware_backend/npu/moe/topk.py
++++ b/python/sglang/srt/hardware_backend/npu/moe/topk.py
+@@ -10,6 +10,12 @@ from sglang.srt.layers.moe.topk import (
+     capture_routed_experts_if_allowed,
+     select_experts,
+ )
++from sglang.srt.utils import get_bool_env_var
++
++# MoE 前段融合包（moe_front_fusion/v1，六轮单测定案）总开关：
++# renorm=1 单算子路由 + v2.2 自写 init_routing。默认关，开启：
++# SGLANG_MOE_FRONT_FUSION=1。仅作用于下方 fast path（无 group/无 bias）。
++_moe_front_fusion = get_bool_env_var("SGLANG_MOE_FRONT_FUSION")
+ 
+ if TYPE_CHECKING:
+     from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+@@ -45,18 +51,40 @@ def fused_topk_npu(
+ 
+     # Fast path: simple top-k without grouped routing and bias
+     if not use_grouped_topk and correction_bias is None:
+-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
+-            router_logits,
+-            k=topk_config.top_k,
+-        )
+-
+-        if renormalize:
+-            topk_weights = l1_norm(
+-                topk_weights
+-                if topk_config.num_fused_shared_experts == 0
+-                else topk_weights[:, :-1]
++        if (
++            _moe_front_fusion
++            and renormalize
++            and topk_config.num_fused_shared_experts == 0
++        ):
++            # renorm=1 单算子 = gating_top_k_softmax + l1_norm（六轮单测：
++            # ids 与 stock 链逐位一致含构造并列对抗、weights 差 ≤3e-8，
++            # 链路口径 -10.2µs/层；输入 fp32 化与对拍链口径一致）。
++            topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
++                router_logits.to(torch.float32),
++                k=topk_config.top_k,
++                bias=None,
++                k_group=1,
++                group_count=1,
++                group_select_mode=0,
++                renorm=1,
++                norm_type=0,
++                routed_scaling_factor=1.0,
++                eps=float(1e-20),
+             )
+-        topk_weights = topk_weights.to(torch.float32)
++            topk_weights = topk_weights.to(torch.float32)
++        else:
++            topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
++                router_logits,
++                k=topk_config.top_k,
++            )
++
++            if renormalize:
++                topk_weights = l1_norm(
++                    topk_weights
++                    if topk_config.num_fused_shared_experts == 0
++                    else topk_weights[:, :-1]
++                )
++            topk_weights = topk_weights.to(torch.float32)
+ 
+     # sqrtsoftplus (DSV4 noaux_tc): the NPU op only scores sigmoid/softmax, so use
+     # a torch path. top-k over (scores + bias); weights from un-biased scores.
+diff --git a/python/sglang/srt/hardware_backend/npu/quantization/moe_methods.py b/python/sglang/srt/hardware_backend/npu/quantization/moe_methods.py
+index f08d1af6cd..fb6bed650d 100644
+--- a/python/sglang/srt/hardware_backend/npu/quantization/moe_methods.py
++++ b/python/sglang/srt/hardware_backend/npu/quantization/moe_methods.py
+@@ -17,9 +17,16 @@ from sglang.srt.hardware_backend.npu.moe.hidden_states_quant import (
+     HiddenStatesDynamicQuant,
+ )
+ from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmul
++from sglang.srt.utils import get_bool_env_var
+ 
+ logger = logging.getLogger(__name__)
+ 
++# GMM2（w2 down_proj）走 sgl_kernel_npu.moe.persistent_gmm 的 Triton persistent
++# kernel（默认 stock，开启：SGLANG_GMM2_TRITON=1）。仅作用于下方
++# NPUUnquantMoEMethod（BF16 无量化路径）。迁移自 old_env/grouped_matmul v1.2.1，
++# 基线 sglang main@bd3f6a793；kernel 内推导 offsets，无 torch.cumsum 链。
++_gmm2_triton = get_bool_env_var("SGLANG_GMM2_TRITON")
++
+ 
+ # DEPRECATED METHOD
+ # TODO: Remove in future realeses
+@@ -246,6 +253,7 @@ class NPUW4A4Int4MoEMethod(_NPUMoEMethodBase):
+         output_dtype: torch.dtype,
+         weight_prefix: str,
+         group_list_type,
++        expert_offsets: Optional[torch.Tensor] = None,  # ignored（仅 BF16 无量化路径使用）
+     ) -> torch.Tensor:
+         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+         if pertoken_scale is None:
+@@ -347,6 +355,7 @@ class NPUW8A8Int8MoEMethod(_NPUMoEMethodBase):
+         output_dtype: torch.dtype,
+         weight_prefix: str,
+         group_list_type,
++        expert_offsets: Optional[torch.Tensor] = None,  # ignored（仅 BF16 无量化路径使用）
+     ) -> torch.Tensor:
+         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+         if pertoken_scale is None:
+@@ -503,6 +512,7 @@ class NPUW4A8Int8MoEMethod(_NPUMoEMethodBase):
+         output_dtype: torch.dtype,
+         weight_prefix: str,
+         group_list_type,
++        expert_offsets: Optional[torch.Tensor] = None,  # ignored（仅 BF16 无量化路径使用）
+     ) -> torch.Tensor:
+         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+         if pertoken_scale is None:
+@@ -653,6 +663,7 @@ class NPUWNA16Int4MoEMethod(_NPUMoEMethodBase):
+         output_dtype: torch.dtype,
+         weight_prefix: str,
+         group_list_type,
++        expert_offsets: Optional[torch.Tensor] = None,  # ignored（仅 BF16 无量化路径使用）
+     ) -> torch.Tensor:
+         scale = getattr(quant_info, f"{weight_prefix}_weight_scale", None)
+         offset = getattr(quant_info, f"{weight_prefix}_weight_offset", None)
+@@ -689,7 +700,15 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
+         self._validate_weight_prefix(layer, weight_prefix)
+ 
+         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight")
+-        weight.data = npu_format_cast(weight)
++        if weight_prefix == "w2" and _gmm2_triton:
++            # Triton GMM2 kernel 以裸指针按 [E, N, K] ND 连续存储读取 w2，
++            # 必须跳过 FRACTAL_NZ cast：NZ 分形重排会让裸指针读取出错。
++            # （与 old_env v1.2 集成一致——当时 unquant.py 的 transpose+cast
++            # 整段被注释。stock npu_grouped_matmul 同样接受 ND/NCL 权重，
++            # 当前 TP4 profile 中 GMM 权重输入格式即为 NCL。）
++            weight.data = weight.data.contiguous()
++        else:
++            weight.data = npu_format_cast(weight)
+ 
+         if weight_prefix == "w13":
+             self._set_dispatcher_output_dtype(layer, "bf16")
+@@ -703,7 +722,54 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
+         output_dtype: torch.dtype,
+         weight_prefix: str,
+         group_list_type,
++        expert_offsets: Optional[torch.Tensor] = None,
+     ) -> torch.Tensor:
++        bias_args = self._get_bias_args(quant_info, weight_prefix)
++        if (
++            _gmm2_triton
++            and weight_prefix == "w2"
++            and group_list_type == 1  # per-expert counts（cumulative 不适用）
++            and not bias_args
++        ):
++            # Triton persistent GMM2（gmm/v1，迁移自 old_env grouped_matmul
++            # v1.2.1）：offsets 在 kernel 内由 counts 掩码求和推导，wrapper 不
++            # 含任何 torch 计算（torch.cumsum 链曾实测 ~58us/层并叠加
++            # argsort+scatter 问题致 decode 吞吐 4000→2800，见 bug-fix:
++            # npu-v12-triton-gmm2-rollout-throughput-regression）。
++            # w2 保持 [E, N, K] ND（无需 transpose），expert_tokens 为
++            # per-expert counts（group_list_type=1，int64）。
++            from sgl_kernel_npu.moe.persistent_gmm import (
++                persistent_grouped_matmul,
++            )
++
++            # 一次性取证打印（host 侧元数据，无 device sync，graph capture 安全）：
++            # kernel 的设计契约是 w2 为 [E, N, K]、ND 连续存储（fmt=0）；
++            # fmt=29(FRACTAL_NZ) 或 shape 为 [E, K, N] 都意味着布局被破坏、
++            # 输出必然乱码——排查时先看这行日志。
++            _w2 = getattr(quant_info, "w2_weight")
++            try:
++                import torch_npu as _torch_npu
++
++                _w2_fmt = _torch_npu.get_npu_format(_w2)
++            except Exception:
++                _w2_fmt = "unknown"
++            logger.warning_once(
++                f"[GMM2_TRITON] w2 fmt={_w2_fmt}(0=ND,29=NZ) "
++                f"shape={tuple(_w2.shape)} contig={_w2.is_contiguous()} "
++                f"dtype={_w2.dtype} | x shape={tuple(hidden_states.shape)} "
++                f"dtype={hidden_states.dtype} contig={hidden_states.is_contiguous()} "
++                f"| counts shape={tuple(expert_tokens.shape)} "
++                f"dtype={expert_tokens.dtype}"
++            )
++            return persistent_grouped_matmul(
++                hidden_states,
++                _w2,
++                expert_tokens,
++                # v2.2 自写 init（SGLANG_MOE_FRONT_FUSION=1）原生 excl 直喂，
++                # 省内置 _gmm2_offsets_kernel ~4.4µs/层；None 时走内置前置
++                # kernel（行为与之前完全一致）。
++                offsets=expert_offsets,
++            )
+         return self.matmul.forward(
+             quant_info,
+             weight_prefix,
+@@ -712,5 +778,5 @@ class NPUUnquantMoEMethod(_NPUMoEMethodBase):
+             output_dtype,
+             group_list_type=group_list_type,
+             transposed=False,
+-            **self._get_bias_args(quant_info, weight_prefix),
++            **bias_args,
+         )
+diff --git a/python/sglang/srt/layers/layernorm.py b/python/sglang/srt/layers/layernorm.py
+index 66f5965939..d9c672e6e4 100644
+--- a/python/sglang/srt/layers/layernorm.py
++++ b/python/sglang/srt/layers/layernorm.py
+@@ -161,6 +161,14 @@ if _is_npu:
+     import torch_npu
+     from sgl_kernel_npu.norm.add_rmsnorm_bias import add_gemma_rms_norm
+ 
++    # v1 变更（full_attention A3a）：行并行 add_gemma_rms_norm（grid=(batch,)），
++    # 与 stock 逐位一致；调用点带形状守卫，未命中自动回退 stock
++    # （见 resource/code/full_attention/）
++    from sglang.kernels.ops.attention.full_attention_fusion_npu import (
++        fa_add_gemma_rms_norm_v2,
++        fa_add_gemma_rms_norm_v2_supported,
++    )
++
+ 
+ @lru_cache(maxsize=1)
+ def _get_aiter_per_group_quant():
+@@ -995,9 +1003,17 @@ class GemmaRMSNorm(MultiPlatformOp):
+         if residual is not None:
+             if post_residual_addition is not None:
+                 residual = residual + post_residual_addition
+-            norm_out, residual = add_gemma_rms_norm(
+-                x, self.weight, residual, self.variance_epsilon
+-            )
++            # v1 变更（full_attention A3a）：行并行版（grid=(batch,)），数学与
++            # stock 完全一致（fp32 中间、gemma w+1）；hidden 非 2 的幂/非 bf16/
++            # 非连续时回退 stock
++            if fa_add_gemma_rms_norm_v2_supported(x, residual):
++                norm_out, residual = fa_add_gemma_rms_norm_v2(
++                    x, self.weight, residual, self.variance_epsilon
++                )
++            else:
++                norm_out, residual = add_gemma_rms_norm(
++                    x, self.weight, residual, self.variance_epsilon
++                )
+             return norm_out, residual
+ 
+         x, _ = torch_npu.npu_gemma_rms_norm(x, self.weight, self.variance_epsilon)
+diff --git a/python/sglang/srt/layers/logprob_processor.py b/python/sglang/srt/layers/logprob_processor.py
+index 5ea86a6a5b..103bc6512b 100644
+--- a/python/sglang/srt/layers/logprob_processor.py
++++ b/python/sglang/srt/layers/logprob_processor.py
+@@ -673,16 +673,31 @@ class OutputLogprobProcessor:
+         top_logprobs_nums: List[int],
+         token_ids_logprobs: List[List[int]],
+         batch_next_token_ids: torch.Tensor,
++        logprobs_are_probs: bool,
+     ) -> LogprobResult:
+-        # clamp to avoid -inf values
+-        logprobs.clamp_(min=torch.finfo(logprobs.dtype).min)
++        # Clamp the extracted values instead of the full [batch, vocab]
++        # matrix. clamp(min=const) is elementwise and monotone
++        # non-decreasing, so it commutes with topk/gather: clamping the
++        # small outputs gives identical results (-inf -> finfo.min) while
++        # skipping a full-matrix read+write pass (~0.4 ms/step on NPU).
++        clamp_min = torch.finfo(logprobs.dtype).min
+ 
+         result = LogprobResult()
+         if any(x > 0 for x in top_logprobs_nums):
+-            (
+-                result.top_logprobs_val,
+-                result.top_logprobs_idx,
+-            ) = get_top_logprobs(logprobs, top_logprobs_nums, no_copy_to_cpu=True)
++            # Same extraction as get_top_logprobs, but clamp the
++            # [batch, max_k] topk result in a single kernel before
++            # slicing per request.
++            max_k = max(top_logprobs_nums)
++            top_vals, top_idx = logprobs.topk(max_k, dim=-1)
++            if logprobs_are_probs:
++                top_vals.log_()
++            top_vals.clamp_(min=clamp_min)
++            result.top_logprobs_val = [
++                top_vals[i][:k] for i, k in enumerate(top_logprobs_nums)
++            ]
++            result.top_logprobs_idx = [
++                top_idx[i][:k] for i, k in enumerate(top_logprobs_nums)
++            ]
+ 
+         if any(x is not None for x in token_ids_logprobs):
+             (
+@@ -691,11 +706,19 @@ class OutputLogprobProcessor:
+             ) = get_token_ids_logprobs(
+                 logprobs, token_ids_logprobs, no_copy_to_cpu=True
+             )
+-
+-        result.token_logprobs = logprobs[
+-            torch.arange(len(batch_next_token_ids), device=batch_next_token_ids.device),
+-            batch_next_token_ids,
+-        ]
++            for row in result.token_ids_logprobs_val:
++                if torch.is_tensor(row):
++                    if logprobs_are_probs:
++                        row.log_()
++                    row.clamp_(min=clamp_min)
++
++        # Gather one value per row directly; this removes the temporary arange
++        # and the 2-D advanced-index operation from the hot path.
++        token_indices = batch_next_token_ids.to(dtype=torch.long).view(-1, 1)
++        next_token_logprobs = torch.gather(logprobs, dim=1, index=token_indices).view(-1)
++        if logprobs_are_probs:
++            next_token_logprobs.log_()
++        result.token_logprobs = next_token_logprobs.clamp_(min=clamp_min)
+         return result
+ 
+     def compute_logprobs_only(
+@@ -746,4 +769,4 @@ class OutputLogprobProcessor:
+                 result.token_ids_logprobs_val,
+                 result.token_ids_logprobs_idx,
+             ) = get_token_ids_logprobs_batch_optimized(logprobs, token_ids_logprobs)
+-        return result
++        return result
+\ No newline at end of file
+diff --git a/python/sglang/srt/layers/moe/moe_runner/ascend.py b/python/sglang/srt/layers/moe/moe_runner/ascend.py
+index 7b15281c33..4782819c6c 100644
+--- a/python/sglang/srt/layers/moe/moe_runner/ascend.py
++++ b/python/sglang/srt/layers/moe/moe_runner/ascend.py
+@@ -59,6 +59,8 @@ class AscendRunnerInput(RunnerInput):
+     hidden_states_scale: Optional[torch.Tensor]  # None for unquant
+     expert_tokens: torch.Tensor
+     group_list_type: int  # 0 or 1 (passed to NPU ops)
++    # v2.2 自写 init 原生 exclusive offsets（int32 [E]）；stock init 为 None
++    expert_offsets: Optional[torch.Tensor] = None
+ 
+     @property
+     def runner_backend(self) -> MoeRunnerBackend:
+@@ -159,6 +161,12 @@ class AscendRunnerCore(MoeRunnerCore):
+             )
+ 
+         # --- w2 (down) projection ---
++        # v2.2 自写 init 产出的 exclusive offsets 直喂 persistent GMM2
++        # （offsets= 省 _gmm2_offsets_kernel ~4.4µs/层）；stock init 为 None，
++        # 不加该 kwarg，走 kernel 内置 offsets 前置 kernel（行为不变）。
++        w2_kwargs: dict = {}
++        if runner_input.expert_offsets is not None:
++            w2_kwargs["expert_offsets"] = runner_input.expert_offsets
+         hidden_states = self.config.layer.w2_kernel.apply(
+             quant_info,
+             hidden_states,
+@@ -167,6 +175,7 @@ class AscendRunnerCore(MoeRunnerCore):
+             output_dtype=original_dtype,
+             weight_prefix="w2",
+             group_list_type=group_list_type,
++            **w2_kwargs,
+         )
+         return AscendRunnerOutput(hidden_states=hidden_states)
+ 
+@@ -207,6 +216,7 @@ def pre_permute_ascend_tp_to_ascend(
+         hidden_states_scale=dispatch_output.hidden_states_scale,
+         expert_tokens=dispatch_output.expert_tokens,
+         group_list_type=dispatch_output.group_list_type,
++        expert_offsets=getattr(dispatch_output, "expert_offsets", None),
+     )
+ 
+ 
+diff --git a/python/sglang/srt/layers/moe/token_dispatcher/ascend_tp.py b/python/sglang/srt/layers/moe/token_dispatcher/ascend_tp.py
+index 96921d9951..d1bc3f6031 100644
+--- a/python/sglang/srt/layers/moe/token_dispatcher/ascend_tp.py
++++ b/python/sglang/srt/layers/moe/token_dispatcher/ascend_tp.py
+@@ -10,6 +10,7 @@ from sglang.srt.hardware_backend.npu.moe.finalize_routing import (
+ )
+ from sglang.srt.hardware_backend.npu.moe.init_routing import (
+     NPUMoEInitRouting_v2,
++    NPUMoEInitRouting_v22,
+ )
+ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+ from sglang.srt.layers.moe.token_dispatcher.base import (
+@@ -23,6 +24,12 @@ from sglang.srt.layers.moe.utils import (
+     get_ascend_dispatcher_output_dtype,
+ )
+ from sglang.srt.runtime_context import get_parallel
++from sglang.srt.utils import get_bool_env_var
++
++# MoE 前段融合包（moe_front_fusion/v1）总开关：BF16 路径用 v2.2 自写
++# init_routing（0 容差逐位验收），并向后传 exclusive offsets 供
++# persistent GMM2 直读。默认关，开启：SGLANG_MOE_FRONT_FUSION=1。
++_moe_front_fusion = get_bool_env_var("SGLANG_MOE_FRONT_FUSION")
+ 
+ 
+ class AscendTPDispatchOutput(NamedTuple):
+@@ -33,6 +40,8 @@ class AscendTPDispatchOutput(NamedTuple):
+     expanded_row_idx: torch.Tensor
+     expert_tokens: torch.Tensor
+     group_list_type: int
++    # v2.2 自写 init 原生 exclusive offsets（int32 [E]）；stock init 为 None
++    expert_offsets: Optional[torch.Tensor] = None
+ 
+     @property
+     def format(self) -> DispatchOutputFormat:
+@@ -77,7 +86,10 @@ class AscendTPDispatcher(BaseDispatcher):
+         self.ascend_dispatcher_output_dtype = get_ascend_dispatcher_output_dtype(self)
+ 
+         if self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.BF16:
+-            self.init = NPUMoEInitRouting_v2(quant_mode=-1)
++            if _moe_front_fusion:
++                self.init = NPUMoEInitRouting_v22()
++            else:
++                self.init = NPUMoEInitRouting_v2(quant_mode=-1)
+             self.finalize = NPUFinalizeRouting(drop_pad_mode=2)
+             self.group_list_type = 1
+         elif self.ascend_dispatcher_output_dtype == DispatcherOutputDtype.INT8:
+@@ -117,6 +129,8 @@ class AscendTPDispatcher(BaseDispatcher):
+             expanded_row_idx=expanded_row_idx,
+             expert_tokens=expert_tokens,
+             group_list_type=self.group_list_type,
++            # v22 init 产出 exclusive offsets；stock init 无此属性 → None
++            expert_offsets=getattr(self.init, "last_expert_offsets", None),
+         )
+         return self._dispatch_output
+ 
 diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
 index f6942218fd..83862b1df2 100644
 --- a/python/sglang/srt/layers/quantization/unquant.py
@@ -148,8 +1146,450 @@ index f6942218fd..83862b1df2 100644
              layer.w13_kernel.process_weights_after_loading(layer, "w13")
              layer.w2_kernel.process_weights_after_loading(layer, "w2")
              if hasattr(layer, "dispatcher"):
+diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
+index de587ec5f4..8a35283035 100644
+--- a/python/sglang/srt/layers/sampler.py
++++ b/python/sglang/srt/layers/sampler.py
+@@ -83,6 +83,156 @@ class Sampler(nn.Module):
+ 
+         self.output_logprob_processor = OutputLogprobProcessor()
+ 
++        # Generate uniform noise on a side stream while the model is running, and
++        # apply the exponential-race transform at consumption time on the main
++        # stream, exactly matching stock aten::exponential_ semantics (NPU
++        # op-plugin composite): x = min(1 - u, 1 - eps/2), q = -log(x).
++        # uniform_() decomposes to DSARandomUniform plus an async
++        # D2D copy, i.e. pure DSA-engine work with no AIV transform kernels, so
++        # the side stream cannot contend with the model's vector-core kernels
++        # even when it overlaps the next forward (v1 ran the full exponential_()
++        # chain here and its AIV tail contended with forward).
++        # This is opt-in because it changes the random-number sequence, although it
++        # preserves the categorical sampling distribution.
++        self.enable_async_exponential = is_npu() and get_bool_env_var(
++            "SGLANG_NPU_ASYNC_EXPONENTIAL"
++        )
++        self._async_exponential_stream = None
++        self._async_exponential_event = None
++        self._async_exponential_u = None
++        self._async_exponential_pending = False
++
++    def can_prepare_async_exponential(
++        self, sampling_info: SamplingBatchInfo
++    ) -> bool:
++        """Return whether this batch can use precomputed uniform noise."""
++        return (
++            self.enable_async_exponential
++            and not sampling_info.is_all_greedy
++            and sampling_info.sampling_seed is None
++            and not sampling_info.need_top_p_sampling
++            and not sampling_info.need_top_k_sampling
++            and not sampling_info.need_min_p_sampling
++        )
++
++    @torch.no_grad()
++    def prepare_async_exponential(
++        self,
++        batch_size: int,
++        vocab_size: int,
++        sampling_info: SamplingBatchInfo,
++        device: torch.device,
++    ) -> bool:
++        """Enqueue U(0,1) noise before model forward on a dedicated NPU stream.
++
++        Reusing the buffer is safe because the side stream first waits for all
++        previously enqueued work on the current stream. The sampling path later
++        inserts a device-side event wait; it never synchronizes the CPU.
++        """
++        if not self.can_prepare_async_exponential(sampling_info):
++            return False
++
++        # A delayed sampler may still own the previous buffer. Do not overwrite it.
++        if self._async_exponential_pending:
++            logger.warning(
++                "Skip async exponential preparation because the previous batch "
++                "has not consumed its random buffer"
++            )
++            return False
++
++        if self._async_exponential_stream is None:
++            self._async_exponential_stream = torch.npu.Stream()
++            self._async_exponential_event = torch.npu.Event()
++            logger.info(
++                "Enabled asynchronous NPU exponential-race sampling "
++                "(uniform noise on side stream, stock-exponential argmax consumption)"
++            )
++
++        current_stream = torch.npu.current_stream()
++        self._async_exponential_stream.wait_stream(current_stream)
++
++        expected_shape = (batch_size, vocab_size)
++        with torch.npu.stream(self._async_exponential_stream):
++            u = self._async_exponential_u
++            if (
++                u is None
++                or tuple(u.shape) != expected_shape
++                or u.dtype != torch.float32
++                or u.device.type != torch.device(device).type
++            ):
++                # SGLang converts next-token logits to FP32 before sampling; the
++                # noise grid must match CANN's fp32 uniform to preserve the
++                # incumbent sampling distribution.
++                u = torch.empty(
++                    expected_shape,
++                    dtype=torch.float32,
++                    device=device,
++                )
++                self._async_exponential_u = u
++            u.uniform_()
++            self._async_exponential_event.record()
++
++        self._async_exponential_pending = True
++        return True
++
++    def _sample_with_async_exponential(
++        self, probs: torch.Tensor
++    ) -> Optional[torch.Tensor]:
++        """Consume precomputed U(0,1) noise using the exponential-race identity.
++
++        The full stock exponential_ transform (complement + clamp + -log) runs
++        here on the main stream (serial work that the sampling path owns
++        anyway), keeping the side stream free of AIV kernels so it cannot
++        slow down the model forward.
++        """
++        if not self._async_exponential_pending:
++            return None
++
++        u = self._async_exponential_u
++        self._async_exponential_pending = False
++        if (
++            u is None
++            or u.shape != probs.shape
++            or u.dtype != probs.dtype
++            or u.device != probs.device
++        ):
++            logger.warning(
++                "Async uniform buffer does not match probs; falling back to "
++                "torch.multinomial (u=%s/%s/%s, probs=%s/%s/%s)",
++                None if u is None else tuple(u.shape),
++                None if u is None else u.dtype,
++                None if u is None else u.device,
++                tuple(probs.shape),
++                probs.dtype,
++                probs.device,
++            )
++            return None
++
++        current_stream = torch.npu.current_stream()
++        current_stream.wait_event(self._async_exponential_event)
++        u.record_stream(current_stream)
++
++        # Do not modify probs in place: the standard backend reuses it for logprobs.
++        # argmax over probs / q with q ~ Exp(1): v1's production consumption
++        # form, kept because the stock argmax kernel is healthy while argmin at
++        # this shape is a slow legacy kernel (0.38ms vs ~0.13ms at bs=128).
++        # q is produced by transforming u in place with the exact stock
++        # aten::exponential_ chain (NPU op-plugin composite, fp32 path):
++        #   x = min(1 - u, 1 - eps/2);  q = -log(x),  eps = finfo(dtype).eps
++        # clamp_max_ replaces stock's ge+masked_fill_ pair with the equivalent
++        # single op (fill x >= 1-eps/2 with 1-eps/2 == min(x, 1-eps/2), since
++        # x <= 1 always): it caps x below 1 so q can never be 0 -- u == 0 maps
++        # to q ~= 5.96e-8 and scores huge, exactly as stock (v2.3 mapped it to
++        # +inf/+0.0 instead). For fp32 q stays within [~5.96e-8, ~16.6],
++        # finite and strictly positive, so the race has no inf/NaN edge.
++        # All transform ops run here on the main stream; the side stream stays
++        # pure DSA uniform with zero AIV kernels.
++        u.neg_().add_(1.0)
++        u.clamp_max_(1.0 - torch.finfo(u.dtype).eps / 2.0)
++        u.log_().neg_()
++        sampled_index = torch.div(probs, u).argmax(dim=-1)
++        return sampled_index.view(-1).to(torch.int32)
++
+     def _preprocess_logits(
+         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
+     ) -> torch.Tensor:
+@@ -116,6 +266,9 @@ class Sampler(nn.Module):
+                 to get the unique seed for each position.
+         """
+         logits = logits_output.next_token_logits
++        # In the plain probability path, keep the softmax output and apply log
++        # only to the values requested by the caller.
++        logprobs_are_probs = False
+ 
+         # Preprocess logits (custom processors and NaN handling)
+         logits = self._preprocess_logits(logits, sampling_info)
+@@ -186,9 +339,13 @@ class Sampler(nn.Module):
+                 # Standard path: do softmax and sample from probs.
+                 logits.div_(sampling_info.temperatures)
+ 
+-                # In-place op to save memory
+-                logits[:] = torch.softmax(logits, dim=-1)
+-                probs = logits
++                # Do not write the softmax output back into logits: the
++                # write-back costs a full-matrix TensorMove pass (~0.2 ms on
++                # NPU at bs=128 x vocab=248320 fp32). logits (now x/T) is not
++                # read again on this path and is overwritten by the next
++                # forward anyway. Trade-off: one extra live [batch, vocab]
++                # fp32 tensor during sampling. (post_sample v1 的 A1 改动)
++                probs = torch.softmax(logits, dim=-1)
+ 
+                 batch_next_token_ids = self._sample_from_probs(
+                     probs, sampling_info, positions, simple_sampling_case
+@@ -207,8 +364,9 @@ class Sampler(nn.Module):
+                     logprobs = (
+                         logprobs_via_logsoftmax_kernel
+                         if logprobs_via_logsoftmax_kernel is not None
+-                        else torch.log(probs)
++                        else probs
+                     )
++                    logprobs_are_probs = logprobs_via_logsoftmax_kernel is None
+                 del probs
+ 
+         if return_logprob:
+@@ -219,6 +377,7 @@ class Sampler(nn.Module):
+                 top_logprobs_nums,
+                 token_ids_logprobs,
+                 batch_next_token_ids,
++                logprobs_are_probs,
+             )
+             logprob_result.write_output_to(logits_output)
+ 
+@@ -239,11 +398,13 @@ class Sampler(nn.Module):
+         Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
+         """
+         if simple_sampling_case:
+-            batch_next_token_ids = sampling_from_probs_torch(
+-                probs,
+-                sampling_seed=sampling_info.sampling_seed,
+-                positions=positions,
+-            )
++            batch_next_token_ids = self._sample_with_async_exponential(probs)
++            if batch_next_token_ids is None:
++                batch_next_token_ids = sampling_from_probs_torch(
++                    probs,
++                    sampling_seed=sampling_info.sampling_seed,
++                    positions=positions,
++                )
+         else:
+             backend = get_server_args().sampling_backend
+             if backend == "flashinfer":
+@@ -430,7 +591,11 @@ class Sampler(nn.Module):
+                     probabilities, sampling_info.sampling_seed, positions
+                 ).view(-1)
+             else:
+-                batch_next_token_ids = torch.multinomial(probs, num_samples=1).view(-1)
++                batch_next_token_ids = self._sample_with_async_exponential(probs)
++                if batch_next_token_ids is None:
++                    batch_next_token_ids = torch.multinomial(
++                        probs, num_samples=1
++                    ).view(-1)
+             return batch_next_token_ids.to(torch.int32)
+         else:
+             assert (
+@@ -777,4 +942,4 @@ def apply_custom_logit_processor(
+ 
+         logger.debug(
+             f"Custom logit processor {processor.__class__.__name__} is applied."
+-        )
++        )
+\ No newline at end of file
+diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
+index 6d09e81332..a979d172d2 100644
+--- a/python/sglang/srt/managers/tp_worker.py
++++ b/python/sglang/srt/managers/tp_worker.py
+@@ -526,6 +526,34 @@ class TpModelWorker(BaseTpWorker):
+             can_run_cuda_graph=can_run_cuda_graph,
+         )
+ 
++    def _prepare_async_exponential(
++        self,
++        forward_batch: ForwardBatch,
++        is_verify: bool,
++    ) -> None:
++        """Start simple-sampling RNG before forward so it can overlap on NPU."""
++        if (
++            is_verify
++            or self.enable_spec
++            or forward_batch.is_prefill_only
++            or not forward_batch.forward_mode.is_decode()
++            or forward_batch.sampling_info is None
++            or forward_batch.sampling_info.grammars is not None
++        ):
++            return
++
++        sampler = self.model_runner.sampler
++        prepare = getattr(sampler, "prepare_async_exponential", None)
++        if prepare is None:
++            return
++
++        prepare(
++            batch_size=forward_batch.batch_size,
++            vocab_size=self.model_runner.model_config.vocab_size,
++            sampling_info=forward_batch.sampling_info,
++            device=forward_batch.input_ids.device,
++        )
++
+     def forward_batch_generation(
+         self,
+         batch: Optional[ScheduleBatch],
+@@ -561,6 +589,7 @@ class TpModelWorker(BaseTpWorker):
+             return self._forward_batch_generation_dllm(forward_batch, batch)
+ 
+         if self.pp_group.is_last_rank:
++            self._prepare_async_exponential(forward_batch, is_verify)
+             out = self.model_runner.forward(
+                 forward_batch,
+                 pp_proxy_tensors=pp_proxy_tensors,
+@@ -653,4 +682,4 @@ class TpModelWorker(BaseTpWorker):
+             expert_distribution_metrics=out.expert_distribution_metrics,
+         )
+         batch_result.next_token_ids = next_token_ids
+-        return batch_result
++        return batch_result
+\ No newline at end of file
+diff --git a/python/sglang/srt/model_executor/forward_batch_info.py b/python/sglang/srt/model_executor/forward_batch_info.py
+index 7e7508cc5a..f52b4e994b 100644
+--- a/python/sglang/srt/model_executor/forward_batch_info.py
++++ b/python/sglang/srt/model_executor/forward_batch_info.py
+@@ -1062,19 +1062,29 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+         seq_positions = seq_positions.view(batch_size, -1)
+         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
+         if all(mm_input is None for mm_input in mm_inputs):
+-            mrope_delta_tensor = torch.zeros(
+-                (batch_size, 1), dtype=torch.int64, device=device
++            # Text-only fast path: every mrope delta is 0, so
++            # (seq_positions + 0).flatten() == seq_positions. Build the (3, N)
++            # mrope positions directly from the parsed seq_positions -- never
++            # batch.spec_info.positions, so the draft_extend_v2 override
++            # (seq_positions=ret.positions) hits this path too -- and skip the
++            # zeros tensor plus the broadcast add.
++            self.mrope_positions = (
++                seq_positions.reshape(-1)
++                .to(dtype=torch.int64)
++                .unsqueeze(0)
++                .repeat(3, 1)
+             )
+-        else:
+-            mrope_deltas = [
+-                (
+-                    torch.zeros(1, dtype=torch.int64)
+-                    if mm_inputs[i] is None
+-                    else mm_inputs[i].mrope_position_delta.squeeze(0)
+-                )
+-                for i in range(batch_size)
+-            ]
+-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
++            return
++
++        mrope_deltas = [
++            (
++                torch.zeros(1, dtype=torch.int64)
++                if mm_inputs[i] is None
++                else mm_inputs[i].mrope_position_delta.squeeze(0)
++            )
++            for i in range(batch_size)
++        ]
++        mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+         next_input_positions = (
+             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
+         )
+@@ -1107,12 +1117,33 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
+         return mrope_positions
+ 
+     def _compute_mrope_positions(self, model_runner: ModelRunner, batch: ScheduleBatch):
++        mm_inputs = batch.multimodal_inputs
++        rl_on_policy_target = get_server_args().rl_on_policy_target
++
++        if (
++            self.spec_info is None
++            and batch.dllm_config is None
++            and (
++                rl_on_policy_target is not None
++                or all(mm_input is None for mm_input in mm_inputs)
++            )
++        ):
++            # Regular text generation does not need to rebuild mRoPE on the
++            # host. init_new has already produced the same flattened token
++            # positions on model_runner.device: clamp_position() for decode,
++            # or compute_position() for extend/mixed. Text mRoPE has identical
++            # temporal/height/width coordinates, so materialize the three rows
++            # directly and avoid the per-request host factories, cat, and H2D.
++            self.mrope_positions = (
++                self.positions.to(dtype=torch.int64).unsqueeze(0).repeat(3, 1)
++            )
++            return
++
+         # batch_size * [3 * seq_len]
+         batch_size = self.seq_lens_cpu.shape[0]
+         mrope_positions_list = [[]] * batch_size
+-        rl_on_policy_target = get_server_args().rl_on_policy_target
+         for batch_idx in range(batch_size):
+-            mm_input = batch.multimodal_inputs[batch_idx]
++            mm_input = mm_inputs[batch_idx]
+             if self.forward_mode.is_decode():
+                 # 3 * N
+                 if mm_input is None or rl_on_policy_target is not None:
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index fdf2e69bdd..1a4a538bb5 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -21,6 +21,7 @@ import logging
+ import time
+ from dataclasses import dataclass
+ from typing import Optional, Union
++import os
+ 
+ import torch
+ import torch.distributed as dist
+@@ -215,6 +216,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
+ _is_cpu_arm64 = is_host_cpu_arm64()
+ 
+ if _is_npu:
++    import torch_npu
+     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+ 
+     init_npu_backend()
+@@ -394,6 +396,30 @@ class ModelRunner:
+         self.init_weight_updater()
+         self.init_weight_exporter()
+ 
++        profile_dir = "./outputs/decode_16die_4_engine_tp4_bs64_attn_1_for_2_machines"
++
++        experimental_config = torch_npu.profiler._ExperimentalConfig(
++            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
++            export_type=torch_npu.profiler.ExportType.Db,  # 可选择torch_npu.profiler.ExportType.Text格式
++        )
++
++        self.profiler_npu = torch_npu.profiler.profile(
++            activities=[
++                torch_npu.profiler.ProfilerActivity.CPU,
++                torch_npu.profiler.ProfilerActivity.NPU
++            ],
++            with_modules=True,  # 采集调用栈
++            profile_memory=False,  # 采集内存
++            experimental_config=experimental_config,
++            schedule=torch_npu.profiler.schedule(wait=29, warmup=1, active=10, repeat=1),
++            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
++                profile_dir,
++                analyse_flag=False  # 采集数据保存路径，是否在线解析
++            )
++        )
++        self.profiler_npu.start()
++
++
+     def _initialize_elastic_ep_joiner(self) -> None:
+         if not (
+             self.server_args.elastic_ep_backend is not None
+@@ -1364,6 +1390,8 @@ class ModelRunner:
+         if self.server_args.elastic_ep_backend is not None:
+             self.maybe_join_ep_ranks()
+ 
++        self.profiler_npu.step()
++
+         return output
+ 
+     def _maybe_execute_deferred_mamba_cow_and_clear(
 diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
-index d2b744a680..f39092bf1e 100644
+index d2b744a680..0f59786a2b 100644
 --- a/python/sglang/srt/models/qwen2_moe.py
 +++ b/python/sglang/srt/models/qwen2_moe.py
 @@ -36,6 +36,7 @@ from sglang.srt.distributed import (
@@ -217,8 +1657,34 @@ index d2b744a680..f39092bf1e 100644
  
          if shared_output is not None:
              final_hidden_states.add_(shared_output)
+@@ -502,6 +502,15 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+     ) -> torch.Tensor:
+         current_stream = torch.cuda.current_stream()
+         self.alt_stream.wait_stream(current_stream)
++        # [moe_whole_process/v1] enqueue 换序：先 alt 流长链（router+routed
++        # experts），再主流 shared expert。L0 profiling 证实原顺序下 shared 段
++        # （区域靠前部分）在 replay 时独占设备先跑、未被 routed 链掩盖；换序后
++        # 长链先起步，shared 的小 GEMM 可填 routed 前段小 kernel 的空窗。
++        # 依赖边不变（alt 仍只等 pre-MoE 主流点，汇合仍 main 等 alt），
++        # 两支对 hidden_states 均只读、clone 仍在主流——数值逐位等价。
++        with torch.cuda.stream(self.alt_stream):
++            router_output = self._forward_router_experts(hidden_states)
++
+         shared_output = (
+             self._forward_shared_experts(
+                 hidden_states.clone(), apply_gate=not use_fused_gate
+@@ -526,9 +535,6 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
+                 staged = True
+         # ===== END TO BE REFACTORED ====
+ 
+-        with torch.cuda.stream(self.alt_stream):
+-            router_output = self._forward_router_experts(hidden_states)
+-
+         current_stream.wait_stream(self.alt_stream)
+ 
+         if staged and unstage_shared_expert_add() is None:
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index fcdcb92e06..9299251b30 100644
+index fcdcb92e06..57f1719c0d 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
 @@ -38,6 +38,7 @@ from sglang.srt.configs.qwen3_5 import (
@@ -229,7 +1695,40 @@ index fcdcb92e06..9299251b30 100644
  from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
  from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
  from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-@@ -718,7 +719,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+@@ -210,6 +211,22 @@ if _is_npu:
+     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
+         split_qkvgate_gemma_rmsnorm_rope,
+     )
++    # v1 变更（方案A）：NPU 启用融合 qkvzba split kernel，改用 sgl_kernel_npu 版
++    # （graph 口径比 sglang 侧 triton_gdn_fused_proj 版快，且逐 bit 等价，
++    #  见 resource/code/gdn_mamba/test_a 结果）
++    from sgl_kernel_npu.fla.utils import (
++        fused_qkvzba_split_reshape_cat_contiguous,
++    )
++    # v1 变更（full_attention A1b/A2）：全注意力段 decode 融合 kernel——
++    # A1b split+norm+rope+KV scatter 合一、A2 sigmoid_mul 融合；调用点带形状
++    # 守卫，未命中已验证形状自动回退 stock（见 resource/code/full_attention/）
++    from sglang.kernels.ops.attention.full_attention_fusion_npu import (
++        fa_sigmoid_mul,
++        fa_sigmoid_mul_supported,
++        fa_split_qkvgate_scatter,
++        fa_split_qkvgate_scatter_supported,
++        fa_v4_scatter_context,
++    )
+ 
+ 
+ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -631,7 +648,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+             hidden_states
+         )
+ 
+-        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
++        # v1 变更（方案A）：NPU 也走融合 split kernel（上方 import 已按平台分派）
++        if self.num_v_heads // self.num_k_heads in [1, 2, 4]:
+             if _is_cpu:
+                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
+                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
+@@ -718,7 +736,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                  quant_config=quant_config,
                  alt_stream=(
                      alt_stream
@@ -242,7 +1741,7 @@ index fcdcb92e06..9299251b30 100644
                      else None
                  ),
                  prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
-@@ -943,7 +948,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -943,7 +965,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                  quant_config=quant_config,
                  alt_stream=(
                      alt_stream
@@ -255,7 +1754,80 @@ index fcdcb92e06..9299251b30 100644
                      else None
                  ),
                  prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
-@@ -1340,7 +1349,11 @@ class Qwen3_5ForCausalLM(nn.Module):
+@@ -989,6 +1015,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+ 
+         self.alt_stream = alt_stream
+ 
++        # v1 变更（full_attention A1b）：TP 布局形状守卫在 init 时一次算定
++        # （q=2 头/kv=1 头/head_dim=256/rope=64/带 gate 才走自研融合 kernel）
++        self._fa_v4_shape_ok = _is_npu and fa_split_qkvgate_scatter_supported(
++            self.num_heads,
++            self.num_kv_heads,
++            self.head_dim,
++            int(self.head_dim * self.partial_rotary_factor),
++            self.attn_output_gate,
++        )
++
+     def _apply_qk_norm(
+         self, q: torch.Tensor, k: torch.Tensor
+     ) -> Tuple[torch.Tensor, torch.Tensor]:
+@@ -1113,6 +1149,30 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+         if self.attn.layer_id == (self.config.full_attention_interval - 1):
+             self.rotary_emb.get_cos_sin_with_position(positions)
+ 
++        # v1 变更（full_attention A1b）：decode 且命中已验证形状时，split+norm+rope
++        # 与 KV scatter 合一——k/v 由 kernel 按 out_cache_loc 直接写入 KV cache，
++        # 返回 k/v=None，self_attention 据此以 save_kv_cache=False 走 backend
++        # （跳过 stock 的两次 npu_scatter_nd_update_）。守卫任一环节未命中则回退
++        # stock split；SGLANG_NPU_FULL_ATTN_FUSION_DEBUG=1 可按层打印未命中原因。
++        fa_ctx = fa_v4_scatter_context(self, forward_batch, qkv)
++        if fa_ctx is not None:
++            q, _, _, gate = fa_split_qkvgate_scatter(
++                qkv,
++                self.rotary_emb.position_sin,
++                self.rotary_emb.position_cos,
++                self.q_size,
++                self.kv_size,
++                self.head_dim,
++                int(self.head_dim * self.partial_rotary_factor),
++                eps=self.q_norm.variance_epsilon,
++                q_weight=self.q_norm.weight,
++                k_weight=self.k_norm.weight,
++                kbuf=fa_ctx[0],
++                vbuf=fa_ctx[1],
++                loc=fa_ctx[2],
++            )
++            return q, None, None, gate
++
+         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
+             qkv,
+             self.rotary_emb.position_sin,
+@@ -1160,14 +1220,22 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+                 forward_batch=forward_batch,
+             )
+ 
+-        attn_output = self.attn(q, k, v, forward_batch)
++        # v1 变更（full_attention A1b）：k is None ⟺ KV 已在融合 kernel 内
++        # scatter 进 cache，backend 侧跳过 set_kv_buffer；其余路径 k 恒非 None，
++        # save_kv_cache=True 与 stock 默认值一致
++        attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=k is not None)
+ 
+         if self.attn_output_gate:
+             if not _is_npu:
+                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
+             else:
+                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
+-                attn_output.mul_(torch.sigmoid(gate_val))
++                # v1 变更（full_attention A2）：sigmoid+mul 融合单 kernel，与 stock
++                # 双 op 舍入路径逐位一致；不满足守卫（非 bf16/非连续）回退 stock
++                if fa_sigmoid_mul_supported(attn_output, gate_val):
++                    attn_output = fa_sigmoid_mul(attn_output, gate_val)
++                else:
++                    attn_output.mul_(torch.sigmoid(gate_val))
+ 
+         output, _ = self.o_proj(attn_output)
+         return output
+@@ -1340,7 +1408,11 @@ class Qwen3_5ForCausalLM(nn.Module):
          if _is_hip:
              self._maybe_autodisable_shared_experts_fusion(config, quant_config)
  
@@ -268,6 +1840,35 @@ index fcdcb92e06..9299251b30 100644
  
          # Embedding layer
          if self.pp_group.is_first_rank:
+diff --git a/python/sglang/srt/utils/hf_transformers/processor.py b/python/sglang/srt/utils/hf_transformers/processor.py
+index 38dfa7f0f2..fb2b888d68 100644
+--- a/python/sglang/srt/utils/hf_transformers/processor.py
++++ b/python/sglang/srt/utils/hf_transformers/processor.py
+@@ -146,6 +146,9 @@ def get_processor(
+     model_name: Optional[str] = None,
+     **kwargs,
+ ):
++    # print(f"[tmp log] get_processor {tokenizer_backend=}")
++    # import traceback
++    # traceback.print_stack()
+     if tokenizer_backend == "fastokens":
+         from .tokenizer import _ensure_fastokens_patched
+ 
+diff --git a/python/sglang/srt/utils/hf_transformers/tokenizer.py b/python/sglang/srt/utils/hf_transformers/tokenizer.py
+index def8d25814..7ae32894b0 100644
+--- a/python/sglang/srt/utils/hf_transformers/tokenizer.py
++++ b/python/sglang/srt/utils/hf_transformers/tokenizer.py
+@@ -473,6 +473,10 @@ def get_tokenizer(
+ 
+         return TiktokenTokenizer(tokenizer_name)
+ 
++    # print(f"[tmp log] get_tokenizer {tokenizer_backend=}")
++    # import traceback
++    # traceback.print_stack()
++
+     if tokenizer_backend == "fastokens":
+         _ensure_fastokens_patched()
+ 
 diff --git a/python/sglang/srt/utils/torch_memory_saver_adapter.py b/python/sglang/srt/utils/torch_memory_saver_adapter.py
 index ad98e59283..dd4384c316 100644
 --- a/python/sglang/srt/utils/torch_memory_saver_adapter.py
@@ -301,41 +1902,3 @@ index ad98e59283..dd4384c316 100644
          yield
  
      @contextmanager
-diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
-index a0339d8fb9..f2667a9c49 100644
---- a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
-+++ b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
-@@ -38,6 +38,23 @@ if TYPE_CHECKING:
-     )
- 
- 
-+@contextmanager
-+def _disable_tms_during_graph_capture():
-+    try:
-+        from torch_memory_saver import torch_memory_saver
-+        _impl = torch_memory_saver._impl
-+    except Exception:
-+        _impl = None
-+
-+    if _impl is not None:
-+        _impl._binary_wrapper.cdll.tms_set_interesting_region(False)
-+    try:
-+        yield
-+    finally:
-+        if _impl is not None:
-+            _impl._binary_wrapper.cdll.tms_set_interesting_region(True)
-+
-+
- class NPUCudaGraphBackend(BaseCudaGraphBackend):
-     """One torch.npu.NPUGraph per shape; attention metadata captured
-     inside the graph. replay_with_input_update substitutes fresh
-@@ -120,7 +137,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
-                 auto_dispatch_capture=True,
-             ),
-         ):
--            out = forward_fn()
-+            with _disable_tms_during_graph_capture():
-+                out = forward_fn()
- 
-         self._graphs[shape_key] = graph
-         self._outputs[shape_key] = out

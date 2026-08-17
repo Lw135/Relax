@@ -2,7 +2,10 @@
 
 # Copyright (c) 2026 Relax Authors. All Rights Reserved.
 #
-# Qwen3.5-35B 16xNPU training script.
+# Qwen3-4B 4xGPU fully async training script.
+#
+# Usage:
+#   NUM_GPUS=4 bash scripts/training/text/run-qwen3-4B-4xgpu-async.sh
 
 set -ex
 set -o pipefail
@@ -10,9 +13,9 @@ unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
 
 ulimit -n 65535
 
-export HCCL_SOCKET_IFNAME=xxx
-export GLOO_SOCKET_IFNAME=xxx
-export TP_SOCKET_IFNAME=xxx
+export HCCL_SOCKET_IFNAME=enp48s3u1u1
+export GLOO_SOCKET_IFNAME=enp48s3u1u1
+export TP_SOCKET_IFNAME=enp48s3u1u1
 export HCCL_CONNECT_TIMEOUT=1200
 export RAY_DEDUP_LOGS=0
 export PYTHONBUFFERED=1
@@ -32,13 +35,19 @@ export TORCH_HCCL_ZERO_COPY=1
 export MULTI_STREAM_MEMORY_REUSE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 
+export SGLANG_NPU_USE_MULTI_STREAM=1
+
+export SGLANG_NPU_ASYNC_EXPONENTIAL=1
+export SGLANG_GMM2_TRITON=1
+export SGLANG_MOE_FRONT_FUSION=1
+export SGLANG_NPU_FULL_ATTN_FUSION=1
+
 export ASCEND_USE_FIA=1
 export GDN_ATTN_BACKEND_TRITON=0
 export STREAMS_PER_DEVICE=32
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
-export SGLANG_NPU_USE_MULTI_STREAM=1
-export SGLANG_NPU_ASYNC_EXPONENTIAL=1
+export TASK_QUEUE_ENABLE=1
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
@@ -80,7 +89,7 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
 
    EVAL_ARGS=(
       --log-passrate
-      --eval-interval 20
+      --eval-interval 20000
       --skip-eval-before-train
       --eval-prompt-data aime aime-2024.jsonl
       --n-samples-per-eval-prompt 8
@@ -135,28 +144,25 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
    )
 
    SGLANG_ARGS=(
-   --rollout-num-gpus-per-engine 4
-   --sglang-mem-fraction-static 0.85
-   --sglang-max-running-requests 128
-   --sglang-cuda-graph-bs 2 8 16 24 32 64 128
-   --sglang-device npu
-
-   --sglang-chunked-prefill-size 8192
-   --sglang-max-prefill-tokens 8192
-   --sglang-enable-dp-attention
-
-   --sglang-pp-size 1
-
-   --sglang-dp-size 1
-   --sglang-enable-dp-attention
-   --sglang-enable-dp-lm-head
-   --sglang-attention-backend ascend
-
-   --sglang-mamba-ssm-dtype bfloat16
-   --sglang-mamba-scheduler-strategy extra_buffer
-   --sglang-max-mamba-cache-size 192
-
-   --sglang-ep-size 1
+      --rollout-num-gpus-per-engine 8
+      --sglang-mem-fraction-static 0.85
+      --sglang-max-running-requests 132
+      --sglang-cuda-graph-bs 4 8 16 24 32 40 48 64 128
+      --sglang-device npu
+      # --sglang-disable-radix-cache
+      --mamba-scheduler-strategy extra_buffer
+      --sglang-chunked-prefill-size 8192
+      --sglang-max-prefill-tokens 8192
+      --sglang-enable-dp-attention
+      --sglang-enable-dp-lm-head
+      --sglang-attention-backend ascend
+      --sglang-pp-size 1
+      --sglang-dp-size 1
+      --sglang-ep-size 1
+      --sglang-max-mamba-cache-size 192
+      --sglang-router-policy round_robin
+      --sglang-mamba-ssm-dtype bfloat16
+      --sglang-tokenizer-backend fastokens
    )
 
    MISC_ARGS=(
