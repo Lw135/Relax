@@ -17,7 +17,7 @@
 #   - Uses NPU-specific perf args (--qkv-format bshd, --no-rope-fusion, etc.).
 #
 # Usage:
-#   bash scripts/training/text/run_qwen35_9B_mtp_8xnpu_thd.sh.sh
+#   bash scripts/training/text/run_qwen35_9B_mtp_8xnpu_thd.sh
 
 set -ex
 set -o pipefail
