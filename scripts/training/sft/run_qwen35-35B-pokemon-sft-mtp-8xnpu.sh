@@ -5,7 +5,7 @@
 # Qwen3.5-35B-A3B MTP SFT on pokemon-gpt4o-captions, 8xNPU single-node, ray-submit launch.
 #
 # Usage:
-#   bash scripts/training/sft/run-qwen3.5-35B-A3B-pokemon-mtp-8xnpu.sh
+#   bash scripts/training/sft/run_qwen35-35B-pokemon-sft-mtp-8xnpu.sh
 
 set -ex
 set -o pipefail
