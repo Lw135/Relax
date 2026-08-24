@@ -5,7 +5,7 @@
 # Qwen3.5-35B-A3B 16xNPU colocate training script.
 #
 # Usage:
-#   bash scripts/training/text/run-qwen35-35B-A3B-16xnpu-colocate.sh
+#   bash scripts/training/text/run_qwen35-35B-A3B-16xnpu-colocate-thd.sh
 
 set -ex
 set -o pipefail
