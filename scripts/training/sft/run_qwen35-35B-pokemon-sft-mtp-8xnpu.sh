@@ -98,8 +98,6 @@ PERF_ARGS=(
    --overlap-cpu-optimizer-d2h-h2d
    --use-precision-aware-optimizer
    --no-gradient-accumulation-fusion
-   # --qkv-format bshd
-   # --micro-batch-size 1
 
    # --moe-flex-dispatcher-backend deepep
    # --moe-token-dispatcher-type flex
