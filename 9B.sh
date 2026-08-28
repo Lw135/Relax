@@ -20,7 +20,7 @@ export HCCL_CONNECT_TIMEOUT=1200
 export RAY_DEDUP_LOGS=0
 export PYTHONBUFFERED=1
 
-now=$(date "+%Y-%m-%d-%H:%M:%S")
+now=$(date "+%Y-%m-%d-%H-%M-%S")
 echo "当前时间: $now"
 export ASCEND_COREDUMP_SIGNAL=none
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
@@ -35,13 +35,29 @@ export TORCH_HCCL_ZERO_COPY=1
 export MULTI_STREAM_MEMORY_REUSE=1
 export HCCL_OP_EXPANSION_MODE="AIV"
 
+export SGLANG_NPU_USE_MULTI_STREAM=1
+
+export SGLANG_NPU_ASYNC_EXPONENTIAL=1
+export SGLANG_GMM2_TRITON=0
+export SGLANG_MOE_FRONT_FUSION=1
+export SGLANG_NPU_FULL_ATTN_FUSION=1
+
 export ASCEND_USE_FIA=1
 export GDN_ATTN_BACKEND_TRITON=0
 export STREAMS_PER_DEVICE=32
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
-export SGLANG_NPU_USE_MULTI_STREAM=1
-export SGLANG_NPU_ASYNC_EXPONENTIAL=1
+export TASK_QUEUE_ENABLE=1
+
+export SGLANG_NPU_GDN_UPDATE_FUSED=1
+
+export SGLANG_NPU_TP_ASCENDC_FUSION=1
+export SGLANG_NPU_GDN_RECURRENT_ASCENDC=1
+
+export SGLANG_NPU_EXP_RACE_TRITON=1
+export SGLANG_NPU_GDN_QKVZBA_PACK=1
+export SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M=256
+export SGLANG_NPU_MOE_PREFETCH=0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
@@ -82,7 +98,7 @@ ROLLOUT_ARGS=(
 
 EVAL_ARGS=(
     --log-passrate
-    --eval-interval 20
+    --eval-interval 20000
     --skip-eval-before-train
     --eval-prompt-data aime aime-2024.jsonl
     --n-samples-per-eval-prompt 8
@@ -105,6 +121,7 @@ PERF_ARGS=(
     --qkv-format thd
     # --micro-batch-size 1
     --max-tokens-per-gpu 10240
+    --log-probs-max-tokens-per-gpu 40960
     --no-rope-fusion
     --no-gradient-accumulation-fusion
     --balance-data
@@ -138,26 +155,24 @@ OPTIMIZER_ARGS=(
 
 SGLANG_ARGS=(
    --rollout-num-gpus-per-engine 4
-   --sglang-mem-fraction-static 0.7
-   --sglang-max-running-requests 256
+   --sglang-mem-fraction-static 0.85
+   --sglang-max-running-requests 272
    --sglang-cuda-graph-bs 2 8 16 24 32 64 128 192 256
    --sglang-device npu
-
-   --sglang-chunked-prefill-size 8192
-   --sglang-max-prefill-tokens 8192
-   --sglang-enable-dp-attention
-
-   --sglang-pp-size 1
-   --sglang-dp-size 1
-   --sglang-ep-size 1
-
+   --sglang-mamba-scheduler-strategy extra_buffer
+   --sglang-chunked-prefill-size 16384
+   --sglang-max-prefill-tokens 16384
    --sglang-enable-dp-attention
    --sglang-enable-dp-lm-head
    --sglang-attention-backend ascend
+   --sglang-pp-size 1
+   --sglang-dp-size 1
+   --sglang-ep-size 1
+   --sglang-max-mamba-cache-size 640
+   --sglang-router-policy round_robin
    --sglang-mamba-ssm-dtype bfloat16
-   --sglang-mamba-scheduler-strategy extra_buffer
-   --sglang-max-mamba-cache-size 192
-   )
+   --sglang-tokenizer-backend fastokens
+)
 
 MISC_ARGS=(
     # default dropout in megatron is 0.1
@@ -170,7 +185,7 @@ MISC_ARGS=(
     --attention-backend flash
     --use-flash-attn
 )
-
+# --debug-rollout-only \
 mkdir -p log
     ray job submit ${RAY_NO_WAIT:+--no-wait} --address="http://${MASTER_ADDR}:8265" \
     ${WORKING_DIR:+--working-dir "${WORKING_DIR}"} \
@@ -191,4 +206,4 @@ mkdir -p log
     "${PERF_ARGS[@]}" \
     "${EVAL_ARGS[@]}" \
     "${SGLANG_ARGS[@]}" \
-    "${MISC_ARGS[@]}" 2>&1 | tee log/qwen35-35B-gpu8-sync-thd.log
+    "${MISC_ARGS[@]}" 2>&1 | tee log/9B_multi_$now.log

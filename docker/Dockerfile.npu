@@ -24,6 +24,7 @@ ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
 ARG SGLANG_KERNEL_NPU_TAG="2026.7.2"
 ARG arch="aarch64"
 ARG FLA_LIB="/usr/local/python3.11.15/lib/python3.11/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_api/lib"
+ARG SOC_VERSION="Ascend910_9382"
 
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
 ARG DEVICE_TYPE
@@ -124,8 +125,9 @@ RUN mkdir cann-custom-ops && \
 RUN ${PIP_INSTALL} wheel==0.45.1 pybind11 pyyaml decorator scipy attrs psutil && \
     git clone https://github.com/sgl-project/sgl-kernel-npu /root/sgl-kernel-npu && \
     cd /root/sgl-kernel-npu && git checkout 2026.7.2 && \
+    git submodule update --init third_party/catlass third_party/pto-isa && \
     patch -p1 < /root/Relax/docker/npu_patch/sgl-kernel-npu.patch  && \
-    bash build.sh -a kernels && bash build.sh -a memory-saver && bash build.sh -a deepep && \
+    bash build.sh -a kernels ${SOC_VERSION} && bash build.sh -a memory-saver && bash build.sh -a deepep && \
     pip install output/*.whl && \
     cd "$(pip show deep-ep | grep -E '^Location:' | awk '{print $2}')" && ln -s deep_ep/deep_ep_cpp*.so && \
     cd /root && rm -rf /root/sgl-kernel-npu 

@@ -1,3 +1,24 @@
+diff --git a/python/sglang/kernels/ops/attention/fla/cumsum.py b/python/sglang/kernels/ops/attention/fla/cumsum.py
+index 775a8f800e..d288b4cd00 100644
+--- a/python/sglang/kernels/ops/attention/fla/cumsum.py
++++ b/python/sglang/kernels/ops/attention/fla/cumsum.py
+@@ -75,7 +75,15 @@ def chunk_local_cumsum_scalar_kernel(
+         for num_warps in [2, 4, 8]
+         for num_stages in [2, 3, 4]
+     ],
+-    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE", "HAS_SCALE"],
++    # post_sample v3.1: key trimmed 7 -> 6 entries (dropped "HAS_SCALE").
++    # triton-ascend replaces triton.autotune with its AutoTilingTuner once the
++    # first Triton kernel is compiled in the process; AutoTilingTuner rejects
++    # key lists longer than its 6 axis names (x/y/z/w/v/t) at decoration time,
++    # so importing this module AFTER any Triton compile crashed engine boot
++    # with "Number of parameters exceeds the number of available axes".
++    # The key only controls autotune cache granularity; the tuned configs
++    # (BS/num_warps/num_stages) are unchanged.
++    key=["B", "H", "S", "BT", "IS_VARLEN", "REVERSE"],
+ )
+ @triton.jit(do_not_specialize=["T"])
+ def chunk_local_cumsum_vector_kernel(
 diff --git a/python/sglang/kernels/ops/attention/full_attention_fusion_npu.py b/python/sglang/kernels/ops/attention/full_attention_fusion_npu.py
 new file mode 100644
 index 0000000000..c07c3fc96e
@@ -465,24 +486,409 @@ index 0000000000..c07c3fc96e
 +        SCATTER_KV=True,
 +    )
 +    return q_out, None, None, gate_out
+diff --git a/python/sglang/kernels/ops/tp_ascendc_fusion_npu.py b/python/sglang/kernels/ops/tp_ascendc_fusion_npu.py
+new file mode 100644
+index 0000000000..0618459f1a
+--- /dev/null
++++ b/python/sglang/kernels/ops/tp_ascendc_fusion_npu.py
+@@ -0,0 +1,357 @@
++# Qwen3.5-35B-A3B NPU decode TP 主流线 AscendC 融合 v2（tp_ascendc_fusion_v2 包）开关/守卫模块。
++#
++# 两个算子（sgl-kernel-npu 主 csrc 注册为 torch.ops.npu.*，算子包与注册清单见
++# resource/code/tp_ascendc_fusion_v2/sgl_kernel_npu/csrc/<op>/REGISTRATION.md）：
++#   op1 fused_qkvzba_conv1d           GDN decode：qkvzba split + causal_conv1d(UPDATE)
++#                                     单 kernel，返回 (y, z, b, a)，conv_states 原地更新。
++#                                     【v1 移植】v1 八轮上机唯一精度+性能双过的算子
++#                                     （图模式 fused 7.5~18.3µs vs ref 11.2~31.1µs）。
++#   op2 fused_sigmoid_gating_recurrent GDN decode：sigmoid gating + delta rule update
++#                                     单 kernel（AIV_ONLY），生产 Triton kernel（方案B
++#                                     strided 形态）的 drop-in 替代，ssm pool 原地更新。
++#                                     【v2 新增】访存模式换代：每 (slot,head) 32KB 全连续
++#                                     DMA，摆脱 BV=64 半行模式。
++#
++# v1 的 fused_norm_qkv_proj_scatter / fused_sigmoid_mul_mm 不随 v2 构建（v1 第八轮
++# 止损下线：MIX 单 kernel 固定开销 ~21-23µs，图模式落后 stock 1.2~3.2x 且天花板≈追平）。
++# 为兼容服务器上可能存在的 v1 版 qwen3_5.py（其 import 本模块的 5 个守卫函数），
++# 这两个算子的守卫函数以「恒停用」桩形式保留（返回 False/None，永不激活）——
++# 与 v1 第八轮的默认下线状态一致。
++#
++# 开关：
++#   SGLANG_NPU_TP_ASCENDC_FUSION          总开关（默认 "0"），仅 op1 跟随
++#   SGLANG_NPU_TP_ASCENDC_FUSION_QKVZBA   op1 分开关：未设置随总开关，显式 "0" 单关
++#   SGLANG_NPU_GDN_RECURRENT_ASCENDC      op2 开关（默认 "0"）；在 gdn_triton.py import
++#                                         期判定，须在建图/服务启动前设置
++#   SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG=1  守卫未命中按 key 一次性打印
++# 图 capture 时守卫判定随 Python 分支烘进图，capture 后改 env 无效。
++#
++# 部署：本文件新增到 <sglang>/python/sglang/kernels/ops/tp_ascendc_fusion_npu.py
++# （沿用 v1 模块名直接覆盖；op1 接口与 v1 逐字一致，op2/3 接口为恒停用桩）。
++
++import logging
++import os
++
++import torch
++
++logger = logging.getLogger(__name__)
++
++_TP_FUSION_ENV = "SGLANG_NPU_TP_ASCENDC_FUSION"
++_TP_FUSION_QKVZBA_ENV = "SGLANG_NPU_TP_ASCENDC_FUSION_QKVZBA"
++_GDN_RECURRENT_ASCENDC_ENV = "SGLANG_NPU_GDN_RECURRENT_ASCENDC"
++_TP_DEBUG_ENV = "SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG"
++_tp_debug_logged = set()
++
++# op host 侧硬约束（与 csrc host TORCH_CHECK 逐条对应，见各 REGISTRATION.md）：
++_TP_C0_ALIGN = 16  # bf16 C0 对齐（op1 行宽须 16 倍数）
++_RECURRENT_HEAD_DIM = 128  # fused_sigmoid_gating_recurrent kernel 特化 K/V
++_RECURRENT_MAX_HV = 8  # 同上 gating [8] pad 上限
++_RECURRENT_MAX_N = 256  # 同上 cu/idx UB 驻留上限（生产 bs<=128）
++
++_TP_OP_CACHE = {}
++
++
++def tp_fusion_enabled() -> bool:
++    """TP 线 AscendC 融合总开关（默认关；="1" 启用，仅 op1 跟随）。"""
++    return os.environ.get(_TP_FUSION_ENV, "0") == "1"
++
++
++def tp_fusion_qkvzba_enabled() -> bool:
++    """op1（fused_qkvzba_conv1d）开关：分开关未设置时随总开关，显式 "0" 单独关。
++    图模式实证领先（v1 ut_result_4：7.5~18.3 vs 11.2~31.1µs），v2 保留。"""
++    return os.environ.get(
++        _TP_FUSION_QKVZBA_ENV, os.environ.get(_TP_FUSION_ENV, "0")
++    ) == "1"
++
++
++def gdn_recurrent_ascendc_enabled() -> bool:
++    """op2（fused_sigmoid_gating_recurrent，AscendC recurrent）开关：默认 "0"，
++    显式 "1" 才开。精度走 re-baseline 验收路径（见包 README「精度闸门」节）。"""
++    return os.environ.get(_GDN_RECURRENT_ASCENDC_ENV, "0") == "1"
++
++
++def tp_debug_log(key, msg):
++    """debug 开关打开时按 key 一次性打日志（定位守卫未命中环节用）。"""
++    if os.environ.get(_TP_DEBUG_ENV, "0") != "1":
++        return
++    if key in _tp_debug_logged:
++        return
++    _tp_debug_logged.add(key)
++    logger.warning("[tp_ascendc_fusion_v2] %s", msg)
++
++
++def tp_op_available(name: str) -> bool:
++    """torch.ops.npu 上算子是否已注册（即 sgl-kernel-npu 是否已带本包算子构建）。
++
++    注册发生在 sgl_kernel_npu 扩展加载时（进程启动期），结果进程内静态，故缓存。
++    """
++    got = _TP_OP_CACHE.get(name)
++    if got is None:
++        got = hasattr(torch.ops.npu, name)
++        _TP_OP_CACHE[name] = got
++    return got
++
++
++# ---------------------------------------------------------------------------
++# op1（GDN decode）：fused_qkvzba_conv1d
++#   = fused_qkvzba_split_reshape_cat_contiguous + causal_conv1d(run_mode=1)
++#   【v1 原样移植，八轮上机验证通过】
++# ---------------------------------------------------------------------------
++def tp_fused_qkvzba_conv1d_shape_supported(
++    num_k_heads_tp, num_v_heads_tp, head_k_dim, head_v_dim, conv_kernel_size
++) -> bool:
++    """init 期烘定的形状守卫（Qwen3_5GatedDeltaNet 级；头数为 TP 切分后 per-rank 值）。
++
++    镜像算子 host TORCH_CHECK：num_v%num_k==0 且比值 ∈ {1,2,4}（与被替代的
++    qwen3_5.py split 分支条件一致）、conv width ∈ [2,4]、qkvWidth 与 qkvz 行宽
++    16 对齐（z 拷贝 32B DataCopy 对齐）、z 行字节 ≤ 65535（单块 DataCopy 上限）。
++    """
++    ok = (
++        tp_fusion_qkvzba_enabled()
++        and tp_op_available("fused_qkvzba_conv1d")
++        and num_k_heads_tp > 0
++        and num_v_heads_tp > 0
++        and head_k_dim > 0
++        and head_v_dim > 0
++        and num_v_heads_tp % num_k_heads_tp == 0
++        and (num_v_heads_tp // num_k_heads_tp) in (1, 2, 4)
++        and 2 <= conv_kernel_size <= 4
++    )
++    if ok:
++        qkv_width = 2 * num_k_heads_tp * head_k_dim + num_v_heads_tp * head_v_dim
++        x_row_stride = qkv_width + num_v_heads_tp * head_v_dim
++        ok = (
++            qkv_width % _TP_C0_ALIGN == 0
++            and x_row_stride % _TP_C0_ALIGN == 0
++            and num_v_heads_tp * head_v_dim * 2 <= 65535
++        )
++    if not ok:
++        tp_debug_log(
++            ("qkvzba_shape",),
++            "fused_qkvzba_conv1d init 形状守卫未命中（回退 stock split+causal_conv1d）："
++            f"nk_tp={num_k_heads_tp} nv_tp={num_v_heads_tp} dk={head_k_dim} "
++            f"dv={head_v_dim} width={conv_kernel_size} "
++            f"op_registered={tp_op_available('fused_qkvzba_conv1d')} "
++            f"{_TP_FUSION_QKVZBA_ENV}={os.environ.get(_TP_FUSION_QKVZBA_ENV, '<随总开关>')!r} "
++            f"{_TP_FUSION_ENV}={os.environ.get(_TP_FUSION_ENV, '0')!r}",
++        )
++    return ok
++
++
++def tp_fused_qkvzba_conv1d_inputs_ok(
++    qkvz, mixed_ba, num_k_heads_tp, num_v_heads_tp, head_k_dim, head_v_dim
++) -> bool:
++    """backend 侧运行期轻量判定（tuple 输入的张量属性；形状主集合已在 init 烘定）。
++
++    v2.1（gdn_qkvzba_pack_v1_2）：连续性契约放宽为「行距视图」——列内连续
++    （stride(1)==1）、行距 >= 逻辑宽度且 qkvz 行距 16 倍数（镜像 host 对 z 拷贝
++    32B 对齐的 TORCH_CHECK；pack 打包 N 已补到 16 倍数）。连续输入天然满足，
++    与 v1 行为一致；行距视图（pack 打包 GEMM 输出切片）直读，免两次 .contiguous()。
++    注意：本判定须与本包 csrc host 同版本部署（旧 host 仍 TORCH_CHECK is_contiguous）。
++    """
++    qkv_width = 2 * num_k_heads_tp * head_k_dim + num_v_heads_tp * head_v_dim
++    return (
++        torch.is_tensor(qkvz)
++        and torch.is_tensor(mixed_ba)
++        and qkvz.dim() == 2
++        and mixed_ba.dim() == 2
++        and qkvz.dtype == torch.bfloat16
++        and mixed_ba.dtype == torch.bfloat16
++        and qkvz.stride(1) == 1
++        and qkvz.stride(0) >= qkvz.shape[1]
++        and qkvz.stride(0) % _TP_C0_ALIGN == 0
++        and mixed_ba.stride(1) == 1
++        and mixed_ba.stride(0) >= mixed_ba.shape[1]
++        and qkvz.shape[1] == qkv_width + num_v_heads_tp * head_v_dim
++        and mixed_ba.shape[0] == qkvz.shape[0]
++        and mixed_ba.shape[1] == 2 * num_v_heads_tp
++    )
++
++
++# ---------------------------------------------------------------------------
++# op2（GDN decode）：fused_sigmoid_gating_recurrent（AscendC recurrent，v2 新增）
++#
++# 精度门槛（动工前已与评估文档 §2.2 对齐）：与生产 Triton kernel 逐 bit 不可先验承诺
++# （K 维归约加法顺序 + Exp/Ln/Div 指令级差异），验收 = bf16 臂逐 bit 或 1-ulp 有界 +
++# fp32 臂误差预算（≤ 现 Triton 误差）+ 长程漂移有界 + e2e A/B，RL 显式签字。
++# ---------------------------------------------------------------------------
++def _ascendc_recurrent_supported(
++    q, k, v, a, b, initial_state_source, initial_state_indices, cu_seqlens,
++    A_log, dt_bias,
++) -> bool:
++    """运行期守卫（镜像 host TORCH_CHECK；未命中 → wrapper 回退 stock Triton）。
++
++    只读张量属性（shape/stride/dtype/连续性），不读 device 数据，graph capture 安全。
++    A_log/dt_bias 的 fp32 dtype 不在此卡——wrapper 侧做无损加宽转换（见调用处），
++    此处只校验 numel 防 host TORCH_CHECK 崩出。
++    """
++    ok = (
++        tp_op_available("fused_sigmoid_gating_recurrent")
++        and torch.is_tensor(q)
++        and q.dim() == 4
++        and q.size(0) == 1
++        and cu_seqlens is not None
++        and torch.is_tensor(cu_seqlens)
++        and q.size(1) == cu_seqlens.numel() - 1  # T == N：每序列 1 token
++        and 1 <= q.size(1) <= _RECURRENT_MAX_N
++        and q.size(3) == _RECURRENT_HEAD_DIM
++        and v.size(3) == _RECURRENT_HEAD_DIM
++        and q.size(2) >= 1
++        and v.size(2) >= 1
++        and v.size(2) <= _RECURRENT_MAX_HV
++        and v.size(2) % q.size(2) == 0
++        and q.dtype == torch.bfloat16
++        and k.dtype == torch.bfloat16
++        and v.dtype == torch.bfloat16
++        and a.dtype == torch.bfloat16
++        and b.dtype == torch.bfloat16
++        and initial_state_source.dtype in (torch.bfloat16, torch.float32)
++        and q.stride(3) == 1
++        and k.stride(3) == 1
++        and v.stride(3) == 1
++        and q.stride(2) == q.size(3)
++        and k.stride(2) == k.size(3)
++        and v.stride(2) == v.size(3)
++        and a.is_contiguous()
++        and b.is_contiguous()
++        and initial_state_source.is_contiguous()
++        and initial_state_source.dim() == 4
++        and initial_state_source.size(1) == v.size(2)
++        and initial_state_source.size(2) == _RECURRENT_HEAD_DIM
++        and initial_state_source.size(3) == _RECURRENT_HEAD_DIM
++        and initial_state_indices is not None
++        and initial_state_indices.numel() >= q.size(1)
++        and A_log.numel() == v.size(2)  # host: A_log/dt_bias numel == HV
++        and dt_bias.numel() == v.size(2)
++    )
++    if not ok:
++        tp_debug_log(
++            ("recurrent_shape",),
++            "fused_sigmoid_gating_recurrent 运行期守卫未命中（回退 stock Triton）："
++            f"q={tuple(q.shape)}/{q.dtype} v={tuple(v.shape)}/{v.dtype} "
++            f"pool={tuple(initial_state_source.shape)}/{initial_state_source.dtype} "
++            f"T_vs_N={q.size(1)}/{cu_seqlens.numel() - 1 if torch.is_tensor(cu_seqlens) else None} "
++            f"op_registered={tp_op_available('fused_sigmoid_gating_recurrent')}",
++        )
++    return ok
++
++
++def fused_sigmoid_gating_delta_rule_update_ascendc(
++    A_log,
++    a,
++    dt_bias,
++    softplus_beta,
++    softplus_threshold,
++    q,
++    k,
++    v,
++    b,
++    initial_state_source,
++    initial_state_indices,
++    scale=None,
++    use_qk_l2norm_in_kernel=False,
++    cu_seqlens=None,
++):
++    """生产 Triton wrapper（fused_sigmoid_gating_delta_rule_update_npu，方案B 形态）
++    同签名同语义的 AscendC 版 drop-in，仅 decode（T==N）。
++
++    守卫未命中 → 回退 stock Triton wrapper（静默回退，与本包纪律一致；
++    SGLANG_NPU_TP_ASCENDC_FUSION_DEBUG=1 时打一次原因）。
++    """
++    if not _ascendc_recurrent_supported(
++        q, k, v, a, b, initial_state_source, initial_state_indices, cu_seqlens,
++        A_log, dt_bias,
++    ):
++        from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent import (
++            fused_sigmoid_gating_delta_rule_update_npu,
++        )
++
++        return fused_sigmoid_gating_delta_rule_update_npu(
++            A_log=A_log,
++            a=a,
++            dt_bias=dt_bias,
++            softplus_beta=softplus_beta,
++            softplus_threshold=softplus_threshold,
++            q=q,
++            k=k,
++            v=v,
++            b=b,
++            initial_state_source=initial_state_source,
++            initial_state_indices=initial_state_indices,
++            scale=scale,
++            use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
++            cu_seqlens=cu_seqlens,
++        )
++    # scale 默认值与 Triton wrapper 逐字一致（python 侧 K**-0.5，同 double→float 路径）
++    if scale is None:
++        scale = k.shape[-1] ** -0.5
++    else:
++        assert scale > 0, "scale must be positive"
++    # A_log/dt_bias：host 仅收 fp32，但生产实版 checkpoint 载入后可能为 bf16
++    # （stock Triton kernel 本就 tl.load(...).to(tl.float32)，任意 dtype 都能跑）。
++    # wrapper 侧做无损加宽（bf16→fp32 值域严格包含，与 Triton 核内转换逐 bit 等价），
++    # 并镜像 Triton wrapper 的 .contiguous()；[HV] 小向量，开销可忽略。
++    if A_log.dtype != torch.float32:
++        A_log = A_log.float()
++    if dt_bias.dtype != torch.float32:
++        dt_bias = dt_bias.float()
++    A_log = A_log.contiguous()
++    dt_bias = dt_bias.contiguous()
++    return torch.ops.npu.fused_sigmoid_gating_recurrent(
++        A_log,
++        a,
++        dt_bias,
++        float(softplus_beta),
++        float(softplus_threshold),
++        q,
++        k,
++        v,
++        b,
++        initial_state_source,
++        initial_state_indices,
++        float(scale),
++        cu_seqlens,
++        bool(use_qk_l2norm_in_kernel),
++        q.stride(1),
++        k.stride(1),
++        v.stride(1),
++    )
++
++
++# ---------------------------------------------------------------------------
++# v1 遗留桩（恒停用）：fused_norm_qkv_proj_scatter / fused_sigmoid_mul_mm
++# v1 第八轮止损下线（图模式落后 stock 1.2~3.2x、天花板≈追平），v2 不构建这两个算子。
++# 服务器若存有 v1 版 qwen3_5.py（import 下列 5 个函数），桩保证其可正常运行且
++# 两个候选永不激活；kernel 与单测留档于 code/tp_ascendc_fusion/（eager 口径仍
++# 3~5x，若有 eager 场景需显式打开，请回退部署 v1 包）。
++# ---------------------------------------------------------------------------
++def tp_fusion_nqps_enabled() -> bool:
++    """v1 候选2 开关桩：v2 恒 False（算子不构建，恒停用）。"""
++    return False
++
++
++def tp_fusion_sigmm_enabled() -> bool:
++    """v1 候选3 开关桩：v2 恒 False（算子不构建，恒停用）。"""
++    return False
++
++
++def tp_norm_qkv_scatter_shape_supported(layer) -> bool:
++    """v1 候选2 init 守卫桩：v2 恒 False。"""
++    return False
++
++
++def tp_norm_qkv_scatter_context(
++    layer, hidden_states, residual, forward_batch, captured_last_layer_outputs
++):
++    """v1 候选2 运行期守卫桩：v2 恒 None（调用方回退原链路）。"""
++    return None
++
++
++def tp_sigmoid_mul_mm_shape_supported(o_proj) -> bool:
++    """v1 候选3 init 守卫桩：v2 恒 False。"""
++    return False
++
++
++def tp_sigmoid_mul_mm_runtime_ok(attn_output, gate) -> bool:
++    """v1 候选3 运行期守卫桩：v2 恒 False。"""
++    return False
 diff --git a/python/sglang/srt/entrypoints/http_server.py b/python/sglang/srt/entrypoints/http_server.py
-index 51c85e6302..2915342175 100644
+index 51c85e6302..9f0e206c2c 100644
 --- a/python/sglang/srt/entrypoints/http_server.py
 +++ b/python/sglang/srt/entrypoints/http_server.py
-@@ -636,7 +636,7 @@ async def health_generate(request: Request) -> Response:
+@@ -636,7 +636,8 @@ async def health_generate(request: Request) -> Response:
      ):
          return Response(status_code=200)
  
 -    sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
++    # sampling_params = {"max_new_tokens": 1, "temperature": 0.0}
 +    sampling_params = {"max_new_tokens": 1, "temperature": 1.0, "top_k":-1, "top_p":1.0}
      # uuid keeps rids unique across tokenizer workers (a bare time.time() can
      # collide and crash the shared DetokenizerManager decode_status).
      rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
+diff --git a/python/sglang/srt/environ.py b/python/sglang/srt/environ.py
+index 20d47e37ee..37a7439d68 100644
+--- a/python/sglang/srt/environ.py
++++ b/python/sglang/srt/environ.py
+@@ -586,6 +586,16 @@ class Envs:
+     # NPU
+     SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT = EnvBool(False)
+     SGLANG_NPU_USE_MULTI_STREAM = EnvBool(False)
++    # MoE expert weight L2 prefetch (decode aclgraph; see
++    # hardware_backend/npu/moe_weight_prefetch.py)
++    SGLANG_NPU_MOE_PREFETCH = EnvBool(False)
++    # Comma-separated op list: gmm1 (w13, default) / gmm2 (w2, reserved for v1+)
++    SGLANG_NPU_MOE_PREFETCH_OPS = EnvStr("gmm1")
++    # auto / full / active; v1: auto == full, active falls back to full with warning
++    SGLANG_NPU_MOE_PREFETCH_MODE = EnvStr("auto")
++    SGLANG_NPU_MOE_PREFETCH_CHUNK_MIB = EnvInt(16)
++    # Per-tensor capacity cap in MiB; 0 = auto (0.8 * queried L2 size)
++    SGLANG_NPU_MOE_PREFETCH_BUDGET_MIB = EnvInt(0)
+     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+     # Forward native implementation for activation gelu tanh for model Skywork-Reward-Gemma-2-27B-v0.2
+     SGLANG_NPU_FORWARD_NATIVE_GELUTANH = EnvBool(False)
 diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
-index 7e63f30525..cc9510ff95 100644
+index 7e63f30525..0dc4e285f1 100644
 --- a/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
 +++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_gdn_backend.py
-@@ -5,11 +5,6 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
+@@ -5,12 +5,19 @@ from sgl_kernel_npu.fla.fused_gdn_gating import (
      fused_gdn_gating_kernel_without_sigmoid,
      fused_gdn_gating_npu,
  )
@@ -490,11 +896,23 @@ index 7e63f30525..cc9510ff95 100644
 -    causal_conv1d_fn_npu,
 -    causal_conv1d_update_npu,
 -    causal_conv1d_update_v2,
--)
++
++# TP_FUSION: 候选1（fused_qkvzba_conv1d = split+causal_conv1d 单 kernel）的守卫/
++# 调试/可用性判定，以及 tuple 输入运行期判定不通过时的本地回退 split kernel
++from sgl_kernel_npu.fla.utils import (
++    fused_qkvzba_split_reshape_cat_contiguous,
+ )
  
++from sglang.kernels.ops.tp_ascendc_fusion_npu import (
++    tp_debug_log,
++    tp_fused_qkvzba_conv1d_inputs_ok,
++    tp_fusion_qkvzba_enabled,
++    tp_op_available,
++)
  from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
      AscendMambaAttnBackendBase,
-@@ -26,8 +21,6 @@ from sglang.srt.model_executor.model_runner import ModelRunner
+ )
+@@ -26,8 +33,6 @@ from sglang.srt.model_executor.model_runner import ModelRunner
  from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
  
  fused_gdn_gating = fused_gdn_gating_npu
@@ -503,7 +921,17 @@ index 7e63f30525..cc9510ff95 100644
  
  
  class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
-@@ -109,6 +102,13 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -100,6 +105,9 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+     def init_forward_metadata(self, forward_batch: ForwardBatch):
+         if forward_batch.forward_mode.is_draft_extend_v2():
+             return
++        # cast_elimination_v2：eager（非图）前向的 metadata 由基类现建 int32，
++        # recurrent 无 cast 问题——清掉图流程遗留的 int32 影子，避免误用旧 buffer。
++        self._decode_recurrent_shadow_i32 = None
+         super().init_forward_metadata(forward_batch)
+         self.prepare_gdn_inputs(
+             forward_batch.batch_size,
+@@ -109,6 +117,13 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
          self._prepare_mamba_track_metadata(forward_batch)
          self.graph_mode = False
  
@@ -517,33 +945,133 @@ index 7e63f30525..cc9510ff95 100644
      def forward_decode(
          self,
          layer: RadixLinearAttention,
-@@ -125,16 +125,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -123,18 +138,94 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+         ssm_states = layer_cache.temporal
+         query_start_loc = self.forward_metadata.query_start_loc
          cache_indices = self.forward_metadata.mamba_cache_indices
++        # cast_elimination_v2：recurrent 侧改用 int32 影子 buffer（decode 图流程由
++        # _capture/_replay_metadata 图外 eager 同步，内容与 int64 主 buffer 一致）——
++        # AscendC recurrent host 的 .to(kInt) 变 no-op，图内不再每层 2 个 cast。
++        # conv 侧仍用 int64 主 buffer（host .to(kLong) no-op），两侧契约各取所需。
++        # 影子为 None（eager/verify/未部署 v2）时沿用原 metadata，行为与 v1 逐字一致；
++        # stock/decode-opt Triton recurrent 对索引 dtype 无差，同受本改动无副作用。
++        recurrent_query_start_loc = query_start_loc
++        recurrent_cache_indices = cache_indices
++        if self._decode_recurrent_shadow_i32 is not None:
++            recurrent_query_start_loc, recurrent_cache_indices = (
++                self._decode_recurrent_shadow_i32
++            )
  
-         assert isinstance(mixed_qkv, torch.Tensor)
+-        assert isinstance(mixed_qkv, torch.Tensor)
 -        conv_states_tmp = conv_states.transpose(1, 2).clone()
 -        mixed_qkv = causal_conv1d_update(
-+        mixed_qkv = torch.ops.npu.causal_conv1d(
-             mixed_qkv,
+-            mixed_qkv,
 -            conv_states_tmp,
 -            layer.conv_weights,
 -            layer.bias,
 -            layer.activation,
 -            conv_state_indices=cache_indices,
-+            self._get_conv_weights_t(layer),
-+            conv_states=conv_states,
-+            bias=layer.bias,
-+            query_start_loc=query_start_loc,
-+            cache_indices=cache_indices,
-+            activation_mode=1,
-+            pad_slot_id=-1,
-+            run_mode=1,
-         )
+-        )
 -        conv_states[:] = conv_states_tmp.transpose(1, 2)
++        # TP_FUSION 候选1：qwen3_5.py 侧守卫命中后以 tuple 传入原始投影
++        # (projected_states_qkvz, projected_states_ba)（未经 split）——split +
++        # causal_conv1d(run_mode=1) 由 torch.ops.npu.fused_qkvzba_conv1d 单 kernel
++        # 完成（conv_states 原地更新语义不变），z 随 (core_attn_out, z) 回流给模型侧
++        # （qwen3_5.py 用于 self.norm(core_attn_out, z)）。运行期判定不通过（算子
++        # 未注册/张量属性不符）→ 本地跑原 split kernel 再走 stock conv，同样以
++        # tuple 返回，调用侧无感（静默回退，图 capture 时分支烘进图）。
++        fused_z = None
++        if isinstance(mixed_qkv, tuple):
++            qkvz, mixed_ba = mixed_qkv
++            if tp_fusion_qkvzba_enabled() and tp_op_available(
++                "fused_qkvzba_conv1d"
++            ) and tp_fused_qkvzba_conv1d_inputs_ok(
++                qkvz,
++                mixed_ba,
++                layer.num_k_heads,
++                layer.num_v_heads,
++                layer.head_k_dim,
++                layer.head_v_dim,
++            ):
++                mixed_qkv, fused_z, b, a = torch.ops.npu.fused_qkvzba_conv1d(
++                    qkvz,
++                    self._get_conv_weights_t(layer),
++                    conv_states,
++                    mixed_ba,
++                    layer.num_k_heads,
++                    layer.num_v_heads,
++                    layer.head_k_dim,
++                    layer.head_v_dim,
++                    bias=layer.bias,
++                    query_start_loc=query_start_loc,
++                    cache_indices=cache_indices,
++                    activation_mode=1,
++                    pad_slot_id=-1,
++                )
++            else:
++                tp_debug_log(
++                    ("qkvzba_rt", layer.layer_id),
++                    f"layer {layer.layer_id}: fused_qkvzba_conv1d 运行期判定未命中"
++                    f"（enabled={tp_fusion_qkvzba_enabled()} "
++                    f"op={tp_op_available('fused_qkvzba_conv1d')}），"
++                    "本地 split+stock conv 回退",
++                )
++                mixed_qkv, fused_z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
++                    qkvz,
++                    mixed_ba,
++                    layer.num_k_heads,
++                    layer.num_v_heads,
++                    layer.head_k_dim,
++                    layer.head_v_dim,
++                )
++                mixed_qkv = torch.ops.npu.causal_conv1d(
++                    mixed_qkv,
++                    self._get_conv_weights_t(layer),
++                    conv_states=conv_states,
++                    bias=layer.bias,
++                    query_start_loc=query_start_loc,
++                    cache_indices=cache_indices,
++                    activation_mode=1,
++                    pad_slot_id=-1,
++                    run_mode=1,
++                )
++        else:
++            assert isinstance(mixed_qkv, torch.Tensor)
++            mixed_qkv = torch.ops.npu.causal_conv1d(
++                mixed_qkv,
++                self._get_conv_weights_t(layer),
++                conv_states=conv_states,
++                bias=layer.bias,
++                query_start_loc=query_start_loc,
++                cache_indices=cache_indices,
++                activation_mode=1,
++                pad_slot_id=-1,
++                run_mode=1,
++            )
  
          query, key, value = torch.split(
              mixed_qkv,
-@@ -219,44 +220,41 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+@@ -155,13 +246,17 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
+             A_log=layer.A_log,
+             dt_bias=layer.dt_bias,
+             ssm_states=ssm_states,
+-            cache_indices=cache_indices,
+-            query_start_loc=query_start_loc,
++            cache_indices=recurrent_cache_indices,
++            query_start_loc=recurrent_query_start_loc,
+         )
+ 
+         self._track_mamba_state_decode(
+             forward_batch, conv_states, ssm_states, cache_indices
+         )
++        # TP_FUSION：tuple 输入路径以 (core_attn_out, z) 回流（与 qwen3_5.py 侧
++        # 候选1 分支的解包约定自洽）；tensor 路径返回值与 stock 完全一致
++        if fused_z is not None:
++            return core_attn_out, fused_z
+         return core_attn_out
+ 
+     def forward_extend(
+@@ -219,44 +314,41 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
                  dtype=torch.int32,
                  device=mixed_qkv.device,
              )
@@ -615,13 +1143,141 @@ index 7e63f30525..cc9510ff95 100644
          if is_target_verify:
              g, beta = fused_gdn_gating_kernel_without_sigmoid(
                  layer.A_log, a, b, layer.dt_bias
+diff --git a/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py b/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
+index e1935dc112..f3b108311d 100644
+--- a/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
++++ b/python/sglang/srt/hardware_backend/npu/attention/ascend_hybrid_linear_attn_backend.py
+@@ -27,16 +27,37 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+     def __init__(self, model_runner: ModelRunner):
+         super().__init__(model_runner)
+         self.state_indices_list_gdn = []
++        # cast_elimination_v2：AscendC recurrent（tp_ascendc_fusion_v2 op2，host GM 按
++        # int32_t* 读 cache_indices/cu_seqlens）的 int32 影子 buffer。v1 把
++        # state_indices/query_start_loc 上提 int64 喂 conv（host .to(kLong) no-op），
++        # 代价是 recurrent host 每层 .to(kInt) 真 cast ×2（图内）——同一组 buffer 喂两个
++        # dtype 契约不同的算子，总有一侧要 cast。解法=双 buffer：conv 用 int64 主 buffer，
++        # recurrent 用本组 int32 影子，图外 eager 每 step 同步一次（1~2 个小 copy），
++        # 图内零 cast。仅 decode/idle 图流程使用；eager 与 verify 路径恒 None
++        # （eager 元数据本就是基类现建 int32，无 cast 问题）。
++        self.decode_state_indices_i32_list = []
++        self.decode_query_start_loc_i32_list = []
++        self.cached_cuda_graph_decode_query_start_loc_i32 = None
++        self._decode_recurrent_shadow_i32 = None
+ 
+     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+         assert (
+             max_num_tokens % max_bs == 0
+         ), f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
+         draft_token_num = max_num_tokens // max_bs
++        # cast_elimination v1（= gdn_mamba v2 方案C 单摘）：state_indices_list /
++        # query_start_loc_list / cached_cuda_graph_decode/verify_query_start_loc
++        # 四个 buffer 改 int64，使 conv 类 AscendC 算子（torch.ops.npu.causal_conv1d
++        # 与 tp_fusion 的 fused_qkvzba_conv1d）host 侧的无条件 .to(kLong) 成为
++        # no-op（图内每层每 step 省 2 个 cast kernel）。kernel 本就按 int64_t* 读
++        # （causal_conv1d.h GlobalTensor<int64_t>），无契约变化。全树审计=
++        # 全链路无 int32 硬依赖（Triton kernel dtype 无差、copy_/fill_ 隐式 cast）。
++        # 例外：state_indices_list_gdn 硬依赖 int32（裸传 recurrent_gated_delta_rule
++        # 按 int32_t* 读且无校验，改了静默算错），保持不动。
+         for i in range(max_bs):
+             self.state_indices_list.append(
+                 torch.full(
+-                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
++                    (i + 1,), self.pad_slot_id, dtype=torch.int64, device=self.device
+                 )
+             )
+             self.state_indices_list_gdn.append(
+@@ -48,7 +69,7 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+                 )
+             )
+             self.query_start_loc_list.append(
+-                torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
++                torch.zeros((i + 2,), dtype=torch.int64, device=self.device)
+             )
+             self.retrieve_next_token_list.append(
+                 torch.zeros(
+@@ -65,17 +86,54 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
+                 )
+             )
++            # cast_elimination_v2：int32 影子（recurrent 侧），decode 时每 step 由
++            # _capture/_replay_metadata 从同内容源头同步（不在 verify 使用）。
++            self.decode_state_indices_i32_list.append(
++                torch.full(
++                    (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
++                )
++            )
++            self.decode_query_start_loc_i32_list.append(
++                torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
++            )
+         self.cached_cuda_graph_decode_query_start_loc = torch.arange(
++            0, max_bs + 1, dtype=torch.int64, device=self.device
++        )
++        # cast_elimination_v2：decode query_start_loc 内容是静态 arange——int32 版
++        # init 期预建，decode 影子同步只需一次同 dtype copy（无 cast kernel）。
++        self.cached_cuda_graph_decode_query_start_loc_i32 = torch.arange(
+             0, max_bs + 1, dtype=torch.int32, device=self.device
+         )
+         self.cached_cuda_graph_verify_query_start_loc = torch.arange(
+             0,
+             max_bs * draft_token_num + 1,
+             step=draft_token_num,
+-            dtype=torch.int32,
++            dtype=torch.int64,
+             device=self.device,
+         )
+ 
++    def _update_decode_recurrent_shadow_i32(
++        self, bs: int, mamba_indices: torch.Tensor, num_padding: int = 0
++    ):
++        """cast_elimination_v2：同步 decode 的 int32 影子 buffer（图外 eager，每 step 一次）。
++
++        内容与 int64 主 buffer 完全一致（同一源头 copy_/fill_ 镜像维护），供
++        AscendC recurrent（host 按 int32_t* 读 cache_indices/cu_seqlens）直读，
++        把「每层 2 个图内 cast」换成「每 step 2 个图外小 copy」。仅 decode/idle
++        调用；verify/eager 路径由调用方把 _decode_recurrent_shadow_i32 置 None。
++        """
++        idx_i32 = self.decode_state_indices_i32_list[bs - 1]
++        qsl_i32 = self.decode_query_start_loc_i32_list[bs - 1]
++        idx_i32[: len(mamba_indices)].copy_(mamba_indices)
++        if num_padding == 0:
++            qsl_i32.copy_(self.cached_cuda_graph_decode_query_start_loc_i32[: bs + 1])
++        else:
++            qsl_i32[: bs - num_padding].copy_(
++                self.cached_cuda_graph_decode_query_start_loc_i32[: bs - num_padding]
++            )
++            qsl_i32[bs - num_padding :].fill_(bs - num_padding)
++        self._decode_recurrent_shadow_i32 = (qsl_i32, idx_i32)
++
+     def _capture_metadata(
+         self,
+         bs: int,
+@@ -89,7 +147,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+             self.query_start_loc_list[bs - 1].copy_(
+                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
+             )
++            self._update_decode_recurrent_shadow_i32(bs, mamba_indices)
+         elif forward_mode.is_target_verify():
++            self._decode_recurrent_shadow_i32 = None
+             self.query_start_loc_list[bs - 1].copy_(
+                 self.cached_cuda_graph_verify_query_start_loc[: bs + 1]
+             )
+@@ -163,7 +223,9 @@ class AscendMambaAttnBackendBase(MambaAttnBackendBase):
+                 self.query_start_loc_list[bs - 1][bs - num_padding :].fill_(
+                     bs - num_padding
+                 )
++            self._update_decode_recurrent_shadow_i32(bs, mamba_indices, num_padding)
+         elif forward_mode.is_target_verify():
++            self._decode_recurrent_shadow_i32 = None
+             ssm_state_indices = torch.arange(
+                 bs * spec_info.draft_token_num,
+                 dtype=torch.int32,
 diff --git a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
-index a0339d8fb9..c8f1625247 100644
+index a0339d8fb9..e35d65a2e6 100644
 --- a/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
 +++ b/python/sglang/srt/hardware_backend/npu/graph_runner/npu_cudagraph_backend.py
-@@ -38,6 +38,22 @@ if TYPE_CHECKING:
+@@ -37,6 +37,21 @@ if TYPE_CHECKING:
+         BaseCudaGraphRunner,
      )
- 
  
 +@contextmanager
 +def _disable_tms_during_graph_capture():
@@ -638,11 +1294,10 @@ index a0339d8fb9..c8f1625247 100644
 +    finally:
 +        if _impl is not None:
 +            _impl._binary_wrapper.cdll.tms_set_interesting_region(True)
-+
+ 
  class NPUCudaGraphBackend(BaseCudaGraphBackend):
      """One torch.npu.NPUGraph per shape; attention metadata captured
-     inside the graph. replay_with_input_update substitutes fresh
-@@ -120,7 +136,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
+@@ -120,7 +135,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                  auto_dispatch_capture=True,
              ),
          ):
@@ -722,7 +1377,7 @@ index bce2acf19a..dd45ea6f01 100644
 +        expert_tokens = expert_tokens.to(torch.int64)
 +        return hidden_states, expanded_row_idx, expert_tokens, None
 diff --git a/python/sglang/srt/hardware_backend/npu/moe/topk.py b/python/sglang/srt/hardware_backend/npu/moe/topk.py
-index d594980382..74330fda64 100644
+index d594980382..abab3ee540 100644
 --- a/python/sglang/srt/hardware_backend/npu/moe/topk.py
 +++ b/python/sglang/srt/hardware_backend/npu/moe/topk.py
 @@ -10,6 +10,12 @@ from sglang.srt.layers.moe.topk import (
@@ -738,7 +1393,7 @@ index d594980382..74330fda64 100644
  
  if TYPE_CHECKING:
      from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
-@@ -45,18 +51,40 @@ def fused_topk_npu(
+@@ -45,18 +51,48 @@ def fused_topk_npu(
  
      # Fast path: simple top-k without grouped routing and bias
      if not use_grouped_topk and correction_bias is None:
@@ -759,9 +1414,18 @@ index d594980382..74330fda64 100644
 +        ):
 +            # renorm=1 单算子 = gating_top_k_softmax + l1_norm（六轮单测：
 +            # ids 与 stock 链逐位一致含构造并列对抗、weights 差 ≤3e-8，
-+            # 链路口径 -10.2µs/层；输入 fp32 化与对拍链口径一致）。
++            # 链路口径 -10.2µs/层）。
++            # cast_elimination v1：bf16 直喂（删除原 router_logits.to(fp32) 的
++            # host cast——aclnnMoeGatingTopK 契约支持 BF16 输入，kernel 内
++            # CAST_NONE 精确扩张后 softmax 全程 fp32 计算，与 host 侧 fp32 化
++            # 逐位等价 → ids 逐位不变；yOut 随输入变 bf16，kernel 内 CAST_RINT
++            # 与 torch .to(bf16) 的 RNE 一致 → 下游 ascend_tp.py dispatch 的
++            # .to(hidden_states.dtype) 变 no-op；净消 2 个 cast kernel/层）。
++            # 出口不再 fp32 化（bf16 输出下该 .to(fp32) 会变成真 cast，负优化）；
++            # deepep 线对 topk_weights 无 dtype 转换，其 fp32 契约由
++            # deepep.py 两处 dispatch_a 的防御性 .to(fp32) 恢复（同包 hunk）。
 +            topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
-+                router_logits.to(torch.float32),
++                router_logits,
 +                k=topk_config.top_k,
 +                bias=None,
 +                k_group=1,
@@ -773,7 +1437,6 @@ index d594980382..74330fda64 100644
 +                eps=float(1e-20),
              )
 -        topk_weights = topk_weights.to(torch.float32)
-+            topk_weights = topk_weights.to(torch.float32)
 +        else:
 +            topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k_softmax(
 +                router_logits,
@@ -790,6 +1453,378 @@ index d594980382..74330fda64 100644
  
      # sqrtsoftplus (DSV4 noaux_tc): the NPU op only scores sigmoid/softmax, so use
      # a torch path. top-k over (scores + bias); weights from un-biased scores.
+diff --git a/python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py b/python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py
+new file mode 100644
+index 0000000000..bb8d6a9302
+--- /dev/null
++++ b/python/sglang/srt/hardware_backend/npu/moe_weight_prefetch.py
+@@ -0,0 +1,366 @@
++"""MoE expert weight L2 prefetch for NPU decode (aclgraph replay).
++
++设计文档：resource/docs/practice/npu-qwen35-moe-w13-prefetch-v1-design.md（v1.4 定稿）
++代码包：resource/code/moe_weight_prefetch/（v1.2）
++
++形态（v1.2，相对 v1 的变化由 2026-08-18 服务器首测裁决）：
++- **自目标单发射点 = 本层 prepare_attn 完成后、attention 开始前**：
++  在该点发射**本层**的权重预取。EP 线的层间通信（reduceScatter + allGather）
++  在下一层 prepare_attn 内完成、TP 线的层尾 all_reduce 在上一层
++  postprocess_layer 内完成——该点在两条线下都位于**全部层间通信之后**，
++  根除了 v1（GMM2 结束后发射，与 AIV AR 抢带宽 +3µs）与 v1.1（层尾发射，
++  EP 下压不住 prepare_attn 内的 RS/AG，CMO 与通信同时起跑）两代的通信争用。
++  自目标使 layer 0 也获得 attention 窗口（v1/v1.1 无挂点不覆盖）。
++- GMM1(w13) 全量预取：发射 w13(j)，仅 GDN 层；默认开。
++- GMM2(w2) 全量预取：**并入同一发射点**，w2(j) 块序列接在 w13(j) 之后
++  （消费序：w2 的消费截止于 GMM2(j)，比 w13 晚一个 GMM1+SwiGLU）；默认关。
++  v1 的同层 GMM1-start 发射已废弃——其窗口账（GMM1+SwiGLU ≈ 63µs）系 TP8 口径，
++  ep16 下该窗口仅 ~15-20µs 盖不住 ~56µs 搬运，CMO 与本层 mte2 受限的 GMM 撞车
++  （实测 ep16 双开 max 62.8→100.5µs）。
++  合并发射门控：w13+w2 ≤ 0.8×L2（ep16 128MiB ✓；TP8 192MiB ✗ 自动关闭 gmm2）。
++- best-effort：GMM 前主流不 wait CMO 流（cache 预热无 RAW 冒险），step 末 drain
++  （防跨 step 积压 + 侧流经 event 返回主流的 capture 合法性要求）；
++- 仅 graph capture 期发射（eager / prefill 不激活）；CMO 是 SDMA 任务，不占 AIV/AIC 核。
++- 仅注册过目标模型的层对象会触发发射（`_moe_prefetch_emit` 标记），
++  MTP draft 模型的层即使在同名文件内复用本 forward 也不会误发射。
++
++注意：torch_npu 一律在函数内惰性 import，保证本模块在 CUDA 等其他平台可安全 import。
++"""
++
++from __future__ import annotations
++
++import ctypes
++import glob
++import logging
++import os
++from typing import Dict, Optional
++
++import torch
++
++from sglang.srt.environ import envs
++
++logger = logging.getLogger(__name__)
++
++# ACL_DEV_ATTR_L2_CACHE_SIZE = RT_DEV_ATTR_L2_CACHE_SIZE = 302
++_L2_CACHE_ATTR = 302
++
++_VALID_OPS = ("gmm1", "gmm2")
++_VALID_MODES = ("auto", "full", "active")
++
++
++# ---------------------------------------------------------------------------
++# L2 容量查询（ctypes，免编译；与探针 code/moe_w13_prefetch_probe 同法）
++# ---------------------------------------------------------------------------
++def _dlopen_first(candidates):
++    for path in candidates:
++        try:
++            return ctypes.CDLL(path)
++        except OSError:
++            continue
++    return None
++
++
++def _try_get_info(lib, func_name) -> Optional[int]:
++    fn = getattr(lib, func_name, None)
++    if fn is None:
++        return None
++    fn.restype = ctypes.c_int
++    fn.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.POINTER(ctypes.c_int64)]
++    val = ctypes.c_int64(-1)
++    try:
++        rc = fn(0, _L2_CACHE_ATTR, ctypes.byref(val))
++    except Exception:
++        return None
++    if rc == 0 and val.value > 0:
++        return int(val.value)
++    return None
++
++
++def _query_l2_size_bytes() -> Optional[int]:
++    """返回 L2 cache 字节数；查询失败返回 None（调用方据此关闭预取）。"""
++    home = os.environ.get("ASCEND_TOOLKIT_HOME") or os.environ.get("ASCEND_HOME_PATH")
++    acl_paths = ["libascendcl.so", "libascendcl.so.1"]
++    rt_paths = ["libruntime.so"]
++    if home:
++        acl_paths.append(os.path.join(home, "lib64", "libascendcl.so"))
++        rt_paths.append(os.path.join(home, "lib64", "libruntime.so"))
++    acl_paths += sorted(
++        glob.glob("/usr/local/Ascend/ascend-toolkit/latest/lib64/libascendcl.so*")
++    )
++    rt_paths += sorted(
++        glob.glob("/usr/local/Ascend/ascend-toolkit/latest/lib64/libruntime.so*")
++    )
++
++    lib = _dlopen_first(acl_paths)
++    if lib is not None:
++        for name in ("aclrtGetDeviceInfo", "aclrtGetDeviceAttr"):
++            size = _try_get_info(lib, name)
++            if size is not None:
++                return size
++    lib = _dlopen_first(rt_paths)
++    if lib is not None:
++        size = _try_get_info(lib, "rtsDeviceGetInfo")
++        if size is not None:
++            return size
++    return None
++
++
++def _is_capture_mode() -> bool:
++    """惰性 import，避免模块级依赖 model_executor 链路。"""
++    from sglang.srt.model_executor.runner_utils.capture_mode import (
++        get_is_capture_mode,
++    )
++
++    return get_is_capture_mode()
++
++
++# ---------------------------------------------------------------------------
++# 管理器（进程级单例）
++# ---------------------------------------------------------------------------
++class _MoeWeightPrefetchManager:
++    def __init__(self):
++        self.configured = False
++        self.enabled = False
++        self.prefetch_gmm1 = False
++        self.prefetch_gmm2 = False
++        self.mode = "full"
++        self.chunk_bytes = 16 << 20
++        self.l2_size: Optional[int] = None
++        self.budget_bytes = 0
++        self.stream = None
++        # layer_id -> {"w13": Tensor, "w2": Tensor, "prefetch_target": bool}
++        self.layers: Dict[int, dict] = {}
++        self._capacity_checked = False
++        self._emitted_in_pass = False
++
++    # ---- 配置（首次注册时解析一次） ----
++    def configure(self):
++        if self.configured:
++            return
++        self.configured = True
++
++        if not envs.SGLANG_NPU_MOE_PREFETCH.get():
++            return  # enabled 保持 False，后续全部 no-op
++
++        ops_raw = str(envs.SGLANG_NPU_MOE_PREFETCH_OPS.get()).lower()
++        ops = [t.strip() for t in ops_raw.split(",") if t.strip()]
++        unknown = [t for t in ops if t not in _VALID_OPS]
++        if unknown:
++            logger.warning(
++                f"[MOE_PREFETCH] unknown ops {unknown} ignored, valid: {_VALID_OPS}"
++            )
++        self.prefetch_gmm1 = "gmm1" in ops
++        self.prefetch_gmm2 = "gmm2" in ops
++
++        mode = str(envs.SGLANG_NPU_MOE_PREFETCH_MODE.get()).lower()
++        if mode not in _VALID_MODES:
++            logger.warning(
++                f"[MOE_PREFETCH] unknown mode {mode!r}, fallback to 'auto'"
++            )
++            mode = "auto"
++        if mode == "active":
++            # 图内 npu_prefetch 的 offset/max_size 是捕获期常量、节点无条件执行，
++            # 运行期激活索引喂不进烘死的 CMO 参数；active 需 copy-kernel +
++            # write-allocate 路线（v2）。v1 回退 full。
++            logger.warning(
++                "[MOE_PREFETCH] mode='active' is not supported in v1 "
++                "(in-graph CMO params are capture-time constants); "
++                "falling back to 'full'"
++            )
++            mode = "full"
++        self.mode = "full" if mode == "auto" else mode  # v1: auto ≡ full
++
++        chunk_mib = int(envs.SGLANG_NPU_MOE_PREFETCH_CHUNK_MIB.get())
++        if chunk_mib <= 0:
++            logger.warning(
++                f"[MOE_PREFETCH] invalid CHUNK_MIB={chunk_mib}, fallback to 16"
++            )
++            chunk_mib = 16
++        self.chunk_bytes = chunk_mib << 20
++
++        self.l2_size = _query_l2_size_bytes()
++        if self.l2_size is None:
++            logger.warning(
++                "[MOE_PREFETCH] failed to query L2 cache size "
++                "(aclrtGetDeviceInfo(302)); prefetch disabled"
++            )
++            return
++
++        budget_mib = int(envs.SGLANG_NPU_MOE_PREFETCH_BUDGET_MIB.get())
++        self.budget_bytes = (
++            (budget_mib << 20) if budget_mib > 0 else int(0.8 * self.l2_size)
++        )
++
++        self.enabled = self.prefetch_gmm1 or self.prefetch_gmm2
++        logger.info(
++            f"[MOE_PREFETCH] configured: enabled={self.enabled} "
++            f"gmm1={self.prefetch_gmm1} gmm2={self.prefetch_gmm2} "
++            f"mode={self.mode} chunk={chunk_mib}MiB "
++            f"l2={self.l2_size >> 20}MiB budget={self.budget_bytes >> 20}MiB"
++        )
++
++    # ---- 容量判据（首个 MoE 层注册时检查一次；各层同构） ----
++    def _check_capacity(self, w13_bytes: int, w2_bytes: int):
++        if self._capacity_checked:
++            return
++        self._capacity_checked = True
++        mib = 1 << 20
++        if self.prefetch_gmm1 and w13_bytes > self.budget_bytes:
++            logger.warning(
++                f"[MOE_PREFETCH] w13 size {w13_bytes / mib:.1f}MiB > budget "
++                f"{self.budget_bytes / mib:.1f}MiB (0.8*L2 or BUDGET_MIB); "
++                f"gmm1 prefetch disabled for this config "
++                f"(e.g. TP4 w13=256MiB is a known unsupported case, "
++                f"subset prefetch is a v2 candidate)"
++            )
++            self.prefetch_gmm1 = False
++        if self.prefetch_gmm2:
++            # v1.1 合并发射门控：w13（若 gmm1 开）+ w2 同驻一个跨层窗口，
++            # 合计 ≤ budget 才放行 gmm2。TP8 w13+w2=192MiB=100% L2 不通过
++            # （设计文档 R2 容量冲突），ep16 128MiB 通过。
++            resident = (w13_bytes if self.prefetch_gmm1 else 0) + w2_bytes
++            if resident > self.budget_bytes:
++                logger.warning(
++                    f"[MOE_PREFETCH] resident w13+w2 size {resident / mib:.1f}MiB "
++                    f"> budget {self.budget_bytes / mib:.1f}MiB; "
++                    f"merged gmm2 prefetch disabled for this config "
++                    f"(v1.1 launches w2(i+1) together with w13(i+1) after the "
++                    f"layer-tail all_reduce, so both must fit; "
++                    f"TP8 w13+w2=192MiB is a known unsupported case)"
++                )
++                self.prefetch_gmm2 = False
++        self.enabled = self.prefetch_gmm1 or self.prefetch_gmm2
++        if self.enabled:
++            logger.info(
++                f"[MOE_PREFETCH] capacity check passed: w13={w13_bytes / mib:.1f}MiB "
++                f"(gmm1={self.prefetch_gmm1}) w2={w2_bytes / mib:.1f}MiB "
++                f"(gmm2={self.prefetch_gmm2})"
++            )
++
++    # ---- 模型注册（模型 init 期调用，capture 外） ----
++    def register_model(self, model):
++        self.configure()
++        if not self.enabled:
++            return
++
++        if self.stream is None:
++            import torch_npu  # noqa: F401
++
++            # 专用 CMO 流：capture 外创建（驱动调用），单例复用。
++            self.stream = torch.npu.Stream()
++
++        block_types = None
++        config = getattr(model, "config", None)
++        if config is not None:
++            try:
++                block_types = config.layers_block_type
++            except Exception:
++                block_types = None
++
++        n_reg = 0
++        layers = getattr(model, "layers", None)
++        if layers is None:
++            return
++        for layer in layers:
++            mlp = getattr(layer, "mlp", None)
++            experts = getattr(mlp, "experts", None)
++            w13 = getattr(experts, "w13_weight", None)
++            w2 = getattr(experts, "w2_weight", None)
++            layer_id = getattr(layer, "layer_id", None)
++            if w13 is None or w2 is None or layer_id is None:
++                continue  # 稠密 MLP / PPMissingLayer / 非 MoE 层
++
++            self._check_capacity(
++                w13.numel() * w13.element_size(),
++                w2.numel() * w2.element_size(),
++            )
++            # 目标层判定：仅当 j 为 GDN 层时以其为预取目标
++            # （FA 层 FIA KV 流自逐出 + 抢带宽）。v1.2 自目标发射后
++            # layer 0 也有本层 attention 窗口，不再排除；w13 与 w2 共用目标层集合。
++            is_gdn = (
++                block_types is not None
++                and 0 <= layer_id < len(block_types)
++                and block_types[layer_id] == "linear_attention"
++            )
++            self.layers[layer_id] = {
++                "w13": w13,
++                "w2": w2,
++                "prefetch_target": bool(is_gdn),
++            }
++            # 发射门禁按层对象标记：未注册的层（如 MTP draft 模型的层，
++            # 其 layer_id 可能与注册表碰撞）一律不发射。
++            layer._moe_prefetch_emit = True
++            n_reg += 1
++
++        if n_reg:
++            n_target = sum(1 for v in self.layers.values() if v["prefetch_target"])
++            logger.info(
++                f"[MOE_PREFETCH] registered {n_reg} MoE layers, "
++                f"{n_target} GDN prefetch targets"
++            )
++
++    # ---- 发射（仅 capture 期；best-effort，不 wait） ----
++    def _emit_chunked(self, weights, anchor: torch.Tensor):
++        import torch_npu
++
++        cur = torch.npu.current_stream()
++        self.stream.wait_stream(cur)  # fork 边：罚金由预取流支付
++        with torch.npu.stream(self.stream):
++            for weight in weights:
++                nbytes = weight.numel() * weight.element_size()
++                offset = 0
++                while offset < nbytes:
++                    size = min(self.chunk_bytes, nbytes - offset)
++                    torch_npu.npu_prefetch(weight, anchor, size, offset)
++                    offset += size
++        self._emitted_in_pass = True
++
++    def emit(self, layer, anchor: torch.Tensor):
++        """本层 attention 开始前（层间通信全部完成后）发射本层 w13(+w2) 预取。
++
++        v1.2 自目标发射：发射点 = decoder layer forward 的 prepare_attn 之后。
++        EP 的层间通信（reduceScatter + allGather）在下一层 prepare_attn 内完成、
++        TP 的层尾 AR 在上一层 postprocess_layer 内完成，该点在两条线下都位于
++        全部层间通信之后。块序：w13 在前（消费截止 GMM1），w2 在后
++        （截止 GMM2，多一个 GMM1+SwiGLU 余量）。
++        """
++        if not self.enabled or not _is_capture_mode():
++            return
++        if not getattr(layer, "_moe_prefetch_emit", False):
++            return  # 未注册的层（MTP draft 等）不发射
++        target = self.layers.get(layer.layer_id)
++        if target is None or not target["prefetch_target"]:
++            return
++        weights = []
++        if self.prefetch_gmm1:
++            weights.append(target["w13"])
++        if self.prefetch_gmm2:
++            weights.append(target["w2"])
++        if not weights:
++            return
++        self._emit_chunked(weights, anchor)
++
++    # ---- step 末 drain（模型 forward 的 layer 循环后调用） ----
++    def drain(self):
++        if not self.enabled or not self._emitted_in_pass or not _is_capture_mode():
++            return
++        torch.npu.current_stream().wait_stream(self.stream)
++        self._emitted_in_pass = False
++
++
++_MANAGER = _MoeWeightPrefetchManager()
++
++
++# ---------------------------------------------------------------------------
++# 对外接口（供 qwen3_5.py 调用）
++# ---------------------------------------------------------------------------
++def moe_prefetch_register_model(model):
++    _MANAGER.register_model(model)
++
++
++def moe_prefetch_emit(layer, anchor: torch.Tensor):
++    _MANAGER.emit(layer, anchor)
++
++
++def moe_prefetch_step_drain():
++    _MANAGER.drain()
 diff --git a/python/sglang/srt/hardware_backend/npu/quantization/moe_methods.py b/python/sglang/srt/hardware_backend/npu/quantization/moe_methods.py
 index f08d1af6cd..fb6bed650d 100644
 --- a/python/sglang/srt/hardware_backend/npu/quantization/moe_methods.py
@@ -922,6 +1957,317 @@ index f08d1af6cd..fb6bed650d 100644
 -            **self._get_bias_args(quant_info, weight_prefix),
 +            **bias_args,
          )
+diff --git a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
+index c6942226b1..da8a70c4da 100644
+--- a/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
++++ b/python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py
+@@ -1,3 +1,5 @@
++import os
++
+ import torch
+ 
+ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
+@@ -25,6 +27,26 @@ if is_npu():
+ 
+     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
+     fused_sigmoid_gating_delta_rule_update = fused_sigmoid_gating_delta_rule_update_npu
++
++    # TP_FUSION v2 / gdn_recurrent_decode_opt：NPU decode 的 recurrent kernel 三选一
++    # （import 期判定，须在建图/服务启动前设置 env；图 capture 后改无效）：
++    #   SGLANG_NPU_GDN_RECURRENT_ASCENDC=1  → AscendC 版（tp_ascendc_fusion_v2 包，
++    #       torch.ops.npu.fused_sigmoid_gating_recurrent 的 wrapper；守卫未命中时
++    #       wrapper 内部回退 stock Triton）
++    #   SGLANG_NPU_GDN_UPDATE_FUSED=1       → PR#740 decode 优化 Triton 版
++    #       （gdn_recurrent_decode_opt 包，须已部署 fla 侧文件）
++    #   均未设置                            → stock（生产现版，方案B strided）
++    # 两个 env 同开时 ASCENDC 优先。
++    if os.environ.get("SGLANG_NPU_GDN_RECURRENT_ASCENDC", "0") == "1":
++        from sglang.kernels.ops.tp_ascendc_fusion_npu import (
++            fused_sigmoid_gating_delta_rule_update_ascendc as _gdn_decode_update,
++        )
++    elif os.environ.get("SGLANG_NPU_GDN_UPDATE_FUSED", "0") == "1":
++        from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
++            fused_sigmoid_gating_delta_rule_update_decode_npu as _gdn_decode_update,
++        )
++    else:
++        _gdn_decode_update = fused_sigmoid_gating_delta_rule_update
+ elif is_cpu():
+     from sgl_kernel.mamba import chunk_gated_delta_rule_cpu
+ 
+@@ -150,7 +172,10 @@ class TritonGDNKernel(LinearAttnKernelBase):
+         query_start_loc: torch.Tensor,
+         **kwargs,
+     ) -> torch.Tensor:
+-        return fused_sigmoid_gating_delta_rule_update(
++        # TP_FUSION v2 / decode-opt：_gdn_decode_update 在 import 期按 env 绑定
++        # （ASCENDC / UPDATE_FUSED / stock 三选一）；kwargs 签名三方全对齐，无需改传参。
++        # target_verify 传扩展参数、不经过本方法，不受影响。
++        return _gdn_decode_update(
+             A_log=A_log,
+             dt_bias=dt_bias,
+             q=q,
+diff --git a/python/sglang/srt/layers/exp_race_fused_triton.py b/python/sglang/srt/layers/exp_race_fused_triton.py
+new file mode 100644
+index 0000000000..176a0748d6
+--- /dev/null
++++ b/python/sglang/srt/layers/exp_race_fused_triton.py
+@@ -0,0 +1,256 @@
++# Fused exponential-race sampling consumption for Ascend NPU (post_sample v3).
++#
++# Replaces the v2.3.2 main-stream consumption chain
++#   u.neg_().add_(1.0); torch.minimum(u, bound, out=u); u.log_().neg_()
++#   sampled = torch.div(probs, u).argmax(dim=-1)
++# (5 full-matrix AIV passes + RealDiv + ArgMaxV2, ~1.8 GB of HBM traffic at
++# bs=128 x vocab=248320 fp32) with fused Triton kernels that read probs and u
++# once (~254 MB) and write one int32 index per row.
++#
++# Math is identical to the unfused chain (stock aten::exponential_ NPU
++# composite semantics):
++#   x = min(1 - u, 1 - eps/2);  q = -log(x);  out = argmax_rows(probs / q)
++# The q transform is BITWISE-identical to the AIV chain on this triton-ascend
++# (round-3 UT: full 2^24 u-grid, 0 mismatches, max_ulp=0).
++# Tie-breaking matches torch.argmax: first occurrence wins, within a tile
++# (lowest lane holding the tile max) and across tiles (partials carry the
++# global index; the reducer takes the lowest index among value ties).
++#
++# Two-kernel "partials" structure: kernel 1 writes one (max, arg) slot per
++# tile with NO loop-carried state, kernel 2 reduces the <=64 partials in one
++# tile. Kernel 1 deliberately uses only compiler-verified idioms (round-3
++# root cause: `t * BLOCK_V + tl.arange` reused in value context got its base
++# double-added by triton-ascend -- same family as the gmm2 in-kernel-offsets
++# miscompile):
++#   - loop form identical to the bitwise-proven q kernel:
++#     `for v0 in tl.range(0, V, BLOCK_V)`, loop variable IS the offset;
++#   - `lane = tl.arange(0, BLOCK_V)` is the only index vector used as a VALUE
++#     (never an arithmetically-derived offs);
++#   - global index assembled from scalars only: `v0 + tile_lane`,
++#     `v0 // BLOCK_V` (scalar loop-var arithmetic, proven in the gdn kernels).
++#
++# Fail-closed: if triton is unavailable the module still imports and
++# exp_race_argmax_available() returns False; the sampler keeps the unfused
++# chain.
++
++import torch
++
++try:
++    import triton
++    import triton.language as tl
++
++    _HAS_TRITON = True
++except Exception:  # pragma: no cover - depends on server env
++    _HAS_TRITON = False
++
++# 910_9382 UB per AIV core is 196608 B (192 KB). The compiler places ~8
++# BLOCK_V-sized tile buffers (u/p DMA loads duplicated by auto-multi-buffer
++# plus the x/q/s/cand intermediates), so BLOCK_V=8192 overflows UB at compile
++# time (required 263232 B > 196608 B, observed on the server). 4096 needs
++# ~131.6 KB and fits with ~46% headroom. If a future triton-ascend version
++# still overflows, drop to 2048.
++_BLOCK_V = 4096
++
++# Partials reducer tile width: ceil(248320 / 4096) = 61 partials at the
++# production vocab; 64 covers any V <= 262144 with one tile.
++_BLOCK_NT = 64
++
++if _HAS_TRITON:
++
++    @triton.jit
++    def _exp_race_partial_kernel(
++        probs_ptr,
++        u_ptr,
++        pval_ptr,
++        parg_ptr,
++        V,
++        NT,
++        bound,
++        BLOCK_V: tl.constexpr,
++    ):
++        row = tl.program_id(0).to(tl.int64)
++        base = row * V
++        pbase = row * NT
++        lane = tl.arange(0, BLOCK_V)
++
++        # No loop-carried state: every iteration writes only its own slot.
++        for v0 in tl.range(0, V, BLOCK_V):
++            offs = v0 + lane
++            mask = offs < V
++            # x = min(1 - u, 1 - eps/2): exact in fp32 (1-u is exact on the
++            # uniform grid, min is exact). q = -log(x) stays finite and
++            # strictly positive, so masked lanes pinned at -inf can never win.
++            u = tl.load(u_ptr + base + offs, mask=mask, other=0.5)
++            x = 1.0 - u
++            x = tl.minimum(x, bound)
++            q = -tl.log(x)
++            p = tl.load(probs_ptr + base + offs, mask=mask, other=0.0)
++            s = p / q
++            s = tl.where(mask, s, float("-inf"))
++
++            tile_max = tl.max(s, axis=0)
++            # First-occurrence tie-break inside the tile: lowest LANE holding
++            # the tile max (pure arange as the only index value; global index
++            # reassembled from scalars below). Avoids tl.argmax whose tie
++            # semantics on triton-ascend are unverified.
++            cand = tl.where(s == tile_max, lane, BLOCK_V)
++            tile_lane = tl.min(cand, axis=0)
++            tile_arg = v0 + tile_lane
++
++            slot = v0 // BLOCK_V
++            tl.store(pval_ptr + pbase + slot, tile_max)
++            tl.store(parg_ptr + pbase + slot, tile_arg)
++
++    @triton.jit
++    def _exp_race_partial_argmax_kernel(
++        probs_ptr,
++        u_ptr,
++        pval_ptr,
++        parg_ptr,
++        V,
++        NT,
++        bound,
++        BLOCK_V: tl.constexpr,
++    ):
++        # Diagnostic arm: identical to _exp_race_partial_kernel but takes the
++        # per-tile lane via tl.argmax (tie behavior unverified -- the UT
++        # reports which index it returns on exact ties; production ties are
++        # measure-zero and any in-range tie pick passes fp64 arbitration with
++        # rel diff == 0).
++        row = tl.program_id(0).to(tl.int64)
++        base = row * V
++        pbase = row * NT
++        lane = tl.arange(0, BLOCK_V)
++
++        for v0 in tl.range(0, V, BLOCK_V):
++            offs = v0 + lane
++            mask = offs < V
++            u = tl.load(u_ptr + base + offs, mask=mask, other=0.5)
++            x = 1.0 - u
++            x = tl.minimum(x, bound)
++            q = -tl.log(x)
++            p = tl.load(probs_ptr + base + offs, mask=mask, other=0.0)
++            s = p / q
++            s = tl.where(mask, s, float("-inf"))
++
++            tile_max = tl.max(s, axis=0)
++            tile_lane = tl.argmax(s, axis=0)
++            tile_arg = v0 + tile_lane
++
++            slot = v0 // BLOCK_V
++            tl.store(pval_ptr + pbase + slot, tile_max)
++            tl.store(parg_ptr + pbase + slot, tile_arg)
++
++    @triton.jit
++    def _exp_race_reduce_kernel(
++        pval_ptr,
++        parg_ptr,
++        out_ptr,
++        NT,
++        BLOCK_NT: tl.constexpr,
++    ):
++        row = tl.program_id(0).to(tl.int64)
++        pbase = row * NT
++
++        offs = tl.arange(0, BLOCK_NT)
++        mask = offs < NT
++        vals = tl.load(pval_ptr + pbase + offs, mask=mask, other=float("-inf"))
++        args = tl.load(parg_ptr + pbase + offs, mask=mask, other=2147483647)
++
++        total = tl.max(vals, axis=0)
++        # First occurrence across tiles: lowest global index among value ties
++        # (partials store global indices, so min over matches == torch.argmax).
++        # Only values loaded from memory are compared -- no in-kernel offsets.
++        cand = tl.where(vals == total, args, 2147483647)
++        best = tl.min(cand, axis=0)
++
++        tl.store(out_ptr + row, best)
++
++    @triton.jit
++    def _exp_race_q_kernel(
++        u_ptr,
++        q_ptr,
++        V,
++        bound,
++        BLOCK_V: tl.constexpr,
++    ):
++        # Validation twin (UT only): materializes q = -log(min(1-u, bound))
++        # elementwise so the UT can diff it against the unfused torch chain
++        # (bitwise / ULP report). Not used in the serving path. This kernel's
++        # loop form is the bitwise-proven reference for the partial kernel.
++        row = tl.program_id(0).to(tl.int64)
++        base = row * V
++        for v0 in tl.range(0, V, BLOCK_V):
++            offs = v0 + tl.arange(0, BLOCK_V)
++            mask = offs < V
++            u = tl.load(u_ptr + base + offs, mask=mask, other=0.5)
++            x = 1.0 - u
++            x = tl.minimum(x, bound)
++            q = -tl.log(x)
++            tl.store(q_ptr + base + offs, q, mask=mask)
++
++
++def exp_race_argmax_available() -> bool:
++    return _HAS_TRITON
++
++
++def _bound_for(dtype: torch.dtype) -> float:
++    # Same bound as sampler._async_exp_min_bound: 1 - finfo(dtype).eps / 2
++    # (fp32 -> 1 - 2^-24, exactly representable; passed as an fp32 kernel arg).
++    return 1.0 - torch.finfo(dtype).eps / 2.0
++
++
++def _check_inputs(probs: torch.Tensor, u: torch.Tensor):
++    assert probs.dtype == torch.float32 and u.dtype == torch.float32
++    assert probs.shape == u.shape and probs.dim() == 2
++
++
++def _run_partials(partial_kernel, probs: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
++    B, V = probs.shape
++    NT = (V + _BLOCK_V - 1) // _BLOCK_V
++    assert NT <= _BLOCK_NT, "vocab too large for the partials reducer tile"
++    device = probs.device
++    pval = torch.empty((B, NT), dtype=torch.float32, device=device)
++    parg = torch.empty((B, NT), dtype=torch.int32, device=device)
++    bound = _bound_for(probs.dtype)
++    partial_kernel[(B,)](
++        probs, u, pval, parg, V, NT, bound, BLOCK_V=_BLOCK_V, num_warps=4
++    )
++    out = torch.empty(B, dtype=torch.int32, device=device)
++    _exp_race_reduce_kernel[(B,)](
++        pval, parg, out, NT, BLOCK_NT=_BLOCK_NT, num_warps=4
++    )
++    return out
++
++
++def exp_race_argmax(probs: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
++    """Fused v2.3.2 consumption: row argmax of probs / q(u), int32 [B].
++
++    Two-kernel partials path (production, exact first-occurrence tie-break).
++    Non-destructive: neither probs nor u is modified (the unfused chain
++    rewrote u in place; u is overwritten by the next prepare regardless).
++    """
++    _check_inputs(probs, u)
++    probs = probs.contiguous()
++    u = u.contiguous()
++    return _run_partials(_exp_race_partial_kernel, probs, u)
++
++
++def exp_race_argmax_argmaxarm(probs: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
++    """Diagnostic arm (UT only): per-tile lane via tl.argmax."""
++    _check_inputs(probs, u)
++    probs = probs.contiguous()
++    u = u.contiguous()
++    return _run_partials(_exp_race_partial_argmax_kernel, probs, u)
++
++
++def exp_race_q_values(u: torch.Tensor) -> torch.Tensor:
++    """Validation twin: materialize q for the ULP/bitwise diff (UT only)."""
++    assert u.dtype == torch.float32 and u.dim() == 2
++    u = u.contiguous()
++    B, V = u.shape
++    q = torch.empty_like(u)
++    _exp_race_q_kernel[(B,)](
++        u, q, V, _bound_for(u.dtype), BLOCK_V=_BLOCK_V, num_warps=4
++    )
++    return q
 diff --git a/python/sglang/srt/layers/layernorm.py b/python/sglang/srt/layers/layernorm.py
 index 66f5965939..d9c672e6e4 100644
 --- a/python/sglang/srt/layers/layernorm.py
@@ -1133,6 +2479,30 @@ index 96921d9951..d1bc3f6031 100644
          )
          return self._dispatch_output
  
+diff --git a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+index 9ab8b166c3..eb4a4e0c7e 100644
+--- a/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
++++ b/python/sglang/srt/layers/moe/token_dispatcher/deepep.py
+@@ -506,6 +506,9 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
+         topk_output: TopKOutput,
+     ):
+         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
++        # cast_elimination v1 兼容：front_fusion bf16 直出时恢复 deepep 线
++        # topk_weights 的 fp32 契约（stock/fp32 出口下此行为 no-op）。
++        topk_weights = topk_weights.to(torch.float32)
+         topk_ids = topk_ids.to(torch.int64)
+         if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8:
+             # TODO hard code 128 block quant,use fp8 communication
+@@ -671,6 +674,9 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
+     ):
+         buffer = self._get_buffer()
+         topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
++        # cast_elimination v1 兼容：front_fusion bf16 直出时恢复 deepep 线
++        # topk_weights 的 fp32 契约（stock/fp32 出口下此行为 no-op）。
++        topk_weights = topk_weights.to(torch.float32)
+         topk_ids = topk_ids.to(torch.int64)
+         expected_m = (
+             hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
 diff --git a/python/sglang/srt/layers/quantization/unquant.py b/python/sglang/srt/layers/quantization/unquant.py
 index f6942218fd..83862b1df2 100644
 --- a/python/sglang/srt/layers/quantization/unquant.py
@@ -1147,10 +2517,37 @@ index f6942218fd..83862b1df2 100644
              layer.w2_kernel.process_weights_after_loading(layer, "w2")
              if hasattr(layer, "dispatcher"):
 diff --git a/python/sglang/srt/layers/sampler.py b/python/sglang/srt/layers/sampler.py
-index de587ec5f4..8a35283035 100644
+index de587ec5f4..ccd9ff37c9 100644
 --- a/python/sglang/srt/layers/sampler.py
 +++ b/python/sglang/srt/layers/sampler.py
-@@ -83,6 +83,156 @@ class Sampler(nn.Module):
+@@ -59,6 +59,26 @@ _disable_aiter_greedy_sample = get_bool_env_var("SGLANG_DISABLE_AITER_GREEDY_SAM
+ if is_npu():
+     import torch_npu
+ 
++
++def _is_ascend_910c() -> bool:
++    """Return whether the current NPU is an Ascend 910C-series chip.
++
++    torch.npu.get_device_name() reports names like "Ascend910_9382" on 910C
++    (the production server reports exactly this string). The async
++    exponential-race path below relies on uniform_() decomposing to
++    DSARandomUniform on the DSA_SQE core, which only exists on the 910C
++    series; other NPUs route uniform_() to AIV/AICore RNG kernels that would
++    contend with the model forward. Fail closed on any query error so
++    sampling stays on the stock torch.multinomial path.
++    """
++    if not is_npu():
++        return False
++    try:
++        return torch.npu.get_device_name().startswith("Ascend910_93")
++    except Exception:
++        return False
++
++
+ logger = logging.getLogger(__name__)
+ 
+ SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+@@ -83,6 +103,257 @@ class Sampler(nn.Module):
  
          self.output_logprob_processor = OutputLogprobProcessor()
  
@@ -1164,14 +2561,95 @@ index de587ec5f4..8a35283035 100644
 +        # even when it overlaps the next forward (v1 ran the full exponential_()
 +        # chain here and its AIV tail contended with forward).
 +        # This is opt-in because it changes the random-number sequence, although it
-+        # preserves the categorical sampling distribution.
-+        self.enable_async_exponential = is_npu() and get_bool_env_var(
++        # preserves the categorical sampling distribution. The gate is
++        # additionally restricted to the Ascend 910C series: the side stream is
++        # AIV-free only if uniform_() runs on the DSA_SQE core (910C-only).
++        # On any other device the flag stays off and every batch falls back to
++        # the stock torch.multinomial path.
++        async_exponential_requested = is_npu() and get_bool_env_var(
 +            "SGLANG_NPU_ASYNC_EXPONENTIAL"
 +        )
++        self.enable_async_exponential = (
++            async_exponential_requested and _is_ascend_910c()
++        )
++        if async_exponential_requested and not self.enable_async_exponential:
++            logger.warning(
++                "SGLANG_NPU_ASYNC_EXPONENTIAL is set but the current device is "
++                "not an Ascend 910C series NPU; async exponential-race sampling "
++                "is disabled, falling back to torch.multinomial"
++            )
 +        self._async_exponential_stream = None
 +        self._async_exponential_event = None
 +        self._async_exponential_u = None
 +        self._async_exponential_pending = False
++        self._async_exp_min_bound = None
++
++        # post_sample v3: optional fused Triton consumption kernel. When
++        # resolved, _sample_with_async_exponential replaces the 5-pass
++        # stock-exponential transform + RealDiv + ArgMaxV2 chain (7 full-matrix
++        # AIV passes, ~1.8 GB HBM traffic at bs=128 x vocab=248320 fp32) with
++        # one kernel that reads probs and u once (~254 MB). Same math, same
++        # torch.argmax first-occurrence tie-breaking. Fail-closed: any
++        # import/compile/smoke failure keeps the unfused chain.
++        self._exp_race_fused = None
++        if self.enable_async_exponential and get_bool_env_var(
++            "SGLANG_NPU_EXP_RACE_TRITON", "true"
++        ):
++            self._exp_race_fused = self._init_exp_race_fused()
++
++    @staticmethod
++    def _init_exp_race_fused():
++        """Resolve the fused kernel and smoke-test it against the unfused chain.
++
++        The smoke shape (4, 10000) deliberately exceeds BLOCK_V=4096 so the
++        masked tail path is exercised, and plants boundary u values (0 and
++        1-2^-24, the exact cap grid points) plus an exact score tie to check
++        first-occurrence tie-breaking. Any exception or mismatch disables the
++        fused path (fail-closed).
++        """
++        try:
++            from sglang.srt.layers.exp_race_fused_triton import exp_race_argmax
++
++            device = torch.device("npu")
++            u = torch.rand((4, 10000), dtype=torch.float32, device=device)
++            u[0, 0] = 0.0
++            u[1, 0] = 1.0 - 2.0**-24
++            probs = torch.rand((4, 10000), dtype=torch.float32, device=device)
++            probs = probs / probs.sum(dim=-1, keepdim=True)
++            # Exact score tie at the maximal score: identical (p, u) pair at
++            # two columns with u=0 (q pinned at the 5.96e-8 cap); the lower
++            # index must win, matching torch.argmax.
++            u[:, 50] = 0.0
++            u[:, 60] = 0.0
++            probs[:, 50] = 0.5
++            probs[:, 60] = 0.5
++            fused = exp_race_argmax(probs, u)
++            q = u.neg_().add_(1.0)
++            bound = torch.full(
++                (),
++                1.0 - torch.finfo(torch.float32).eps / 2.0,
++                dtype=torch.float32,
++                device=device,
++            )
++            torch.minimum(q, bound, out=q)
++            q.log_().neg_()
++            reference = torch.div(probs, q).argmax(dim=-1).view(-1).to(torch.int32)
++            if not torch.equal(fused, reference):
++                raise RuntimeError(
++                    f"fused exp-race smoke test mismatch: {fused} vs {reference}"
++                )
++            logger.info(
++                "Enabled fused Triton exp-race consumption kernel "
++                "(SGLANG_NPU_EXP_RACE_TRITON)"
++            )
++            return exp_race_argmax
++        except Exception as e:
++            logger.warning(
++                "Fused Triton exp-race kernel unavailable (%s); falling back "
++                "to the unfused stock-exponential chain",
++                e,
++            )
++            return None
 +
 +    def can_prepare_async_exponential(
 +        self, sampling_info: SamplingBatchInfo
@@ -1288,18 +2766,38 @@ index de587ec5f4..8a35283035 100644
 +        # form, kept because the stock argmax kernel is healthy while argmin at
 +        # this shape is a slow legacy kernel (0.38ms vs ~0.13ms at bs=128).
 +        # q is produced by transforming u in place with the exact stock
-+        # aten::exponential_ chain (NPU op-plugin composite, fp32 path):
++        # aten::exponential_ values (NPU op-plugin composite, fp32 path):
 +        #   x = min(1 - u, 1 - eps/2);  q = -log(x),  eps = finfo(dtype).eps
-+        # clamp_max_ replaces stock's ge+masked_fill_ pair with the equivalent
-+        # single op (fill x >= 1-eps/2 with 1-eps/2 == min(x, 1-eps/2), since
-+        # x <= 1 always): it caps x below 1 so q can never be 0 -- u == 0 maps
-+        # to q ~= 5.96e-8 and scores huge, exactly as stock (v2.3 mapped it to
-+        # +inf/+0.0 instead). For fp32 q stays within [~5.96e-8, ~16.6],
-+        # finite and strictly positive, so the race has no inf/NaN edge.
++        # The guard is a single torch.minimum against a cached 0-dim bound
++        # tensor: min(x, 1-eps/2) is bitwise-identical to stock's
++        # ge+masked_fill_ pair (x <= 1 always), and unlike clamp_max_ it stays
++        # on the template-grade aclnnMinimum kernel -- clamp_max_ routes to
++        # the legacy-family ClipByValueV2 op with two scalar->device uploads
++        # per call, which costs more than the unary-template kernels used by
++        # the rest of the chain. The cap keeps x below 1 so q can never be 0:
++        # u == 0 maps to q ~= 5.96e-8 and scores huge, exactly as stock (v2.3
++        # mapped it to +inf/+0.0 instead). For fp32 q stays within
++        # [~5.96e-8, ~16.6], finite and strictly positive, so the race has no
++        # inf/NaN edge.
 +        # All transform ops run here on the main stream; the side stream stays
 +        # pure DSA uniform with zero AIV kernels.
++        if self._exp_race_fused is not None:
++            # post_sample v3: the same math as the chain below in one Triton
++            # kernel (single pass over probs and u, no intermediate [B, V]
++            # traffic). Non-destructive on u; returns int32 [B] directly.
++            return self._exp_race_fused(probs, u)
++
++        bound = self._async_exp_min_bound
++        if bound is None or bound.dtype != u.dtype or bound.device != u.device:
++            bound = torch.full(
++                (),
++                1.0 - torch.finfo(u.dtype).eps / 2.0,
++                dtype=u.dtype,
++                device=u.device,
++            )
++            self._async_exp_min_bound = bound
 +        u.neg_().add_(1.0)
-+        u.clamp_max_(1.0 - torch.finfo(u.dtype).eps / 2.0)
++        torch.minimum(u, bound, out=u)
 +        u.log_().neg_()
 +        sampled_index = torch.div(probs, u).argmax(dim=-1)
 +        return sampled_index.view(-1).to(torch.int32)
@@ -1307,7 +2805,7 @@ index de587ec5f4..8a35283035 100644
      def _preprocess_logits(
          self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
      ) -> torch.Tensor:
-@@ -116,6 +266,9 @@ class Sampler(nn.Module):
+@@ -116,6 +387,9 @@ class Sampler(nn.Module):
                  to get the unique seed for each position.
          """
          logits = logits_output.next_token_logits
@@ -1317,13 +2815,24 @@ index de587ec5f4..8a35283035 100644
  
          # Preprocess logits (custom processors and NaN handling)
          logits = self._preprocess_logits(logits, sampling_info)
-@@ -186,9 +339,13 @@ class Sampler(nn.Module):
+@@ -184,11 +458,22 @@ class Sampler(nn.Module):
+                     logprobs = logprobs_via_logsoftmax_kernel
+             else:
                  # Standard path: do softmax and sample from probs.
-                 logits.div_(sampling_info.temperatures)
- 
+-                logits.div_(sampling_info.temperatures)
+-
 -                # In-place op to save memory
 -                logits[:] = torch.softmax(logits, dim=-1)
 -                probs = logits
++                # post_sample v3.2：全 batch temperature==1.0 时 div_ 是 IEEE 逐位恒等
++                # （x/1.0==x，不改变任何下游值——softmax/采样/logprob gather 全部 bitwise
++                # 不变），直接跳过 RealDiv（生产 --rollout-temperature 1 命中，
++                # decode 每 step 省 ~27µs）。标记由 SamplingBatchInfo 维护
++                # （host 侧，无 device 同步）；旧版 sampling_batch_info 无此字段时
++                # getattr 默认 False = 不跳过，行为逐字一致。
++                if not getattr(sampling_info, "temperatures_all_one", False):
++                    logits.div_(sampling_info.temperatures)
++
 +                # Do not write the softmax output back into logits: the
 +                # write-back costs a full-matrix TensorMove pass (~0.2 ms on
 +                # NPU at bs=128 x vocab=248320 fp32). logits (now x/T) is not
@@ -1334,7 +2843,7 @@ index de587ec5f4..8a35283035 100644
  
                  batch_next_token_ids = self._sample_from_probs(
                      probs, sampling_info, positions, simple_sampling_case
-@@ -207,8 +364,9 @@ class Sampler(nn.Module):
+@@ -207,8 +492,9 @@ class Sampler(nn.Module):
                      logprobs = (
                          logprobs_via_logsoftmax_kernel
                          if logprobs_via_logsoftmax_kernel is not None
@@ -1345,7 +2854,7 @@ index de587ec5f4..8a35283035 100644
                  del probs
  
          if return_logprob:
-@@ -219,6 +377,7 @@ class Sampler(nn.Module):
+@@ -219,6 +505,7 @@ class Sampler(nn.Module):
                  top_logprobs_nums,
                  token_ids_logprobs,
                  batch_next_token_ids,
@@ -1353,7 +2862,7 @@ index de587ec5f4..8a35283035 100644
              )
              logprob_result.write_output_to(logits_output)
  
-@@ -239,11 +398,13 @@ class Sampler(nn.Module):
+@@ -239,11 +526,13 @@ class Sampler(nn.Module):
          Handles both simple (direct multinomial) and complex (top-k/top-p/min-p) cases.
          """
          if simple_sampling_case:
@@ -1372,7 +2881,7 @@ index de587ec5f4..8a35283035 100644
          else:
              backend = get_server_args().sampling_backend
              if backend == "flashinfer":
-@@ -430,7 +591,11 @@ class Sampler(nn.Module):
+@@ -430,7 +719,11 @@ class Sampler(nn.Module):
                      probabilities, sampling_info.sampling_seed, positions
                  ).view(-1)
              else:
@@ -1385,13 +2894,6 @@ index de587ec5f4..8a35283035 100644
              return batch_next_token_ids.to(torch.int32)
          else:
              assert (
-@@ -777,4 +942,4 @@ def apply_custom_logit_processor(
- 
-         logger.debug(
-             f"Custom logit processor {processor.__class__.__name__} is applied."
--        )
-+        )
-\ No newline at end of file
 diff --git a/python/sglang/srt/managers/tp_worker.py b/python/sglang/srt/managers/tp_worker.py
 index 6d09e81332..a979d172d2 100644
 --- a/python/sglang/srt/managers/tp_worker.py
@@ -1528,6 +3030,68 @@ index 7e7508cc5a..f52b4e994b 100644
              if self.forward_mode.is_decode():
                  # 3 * N
                  if mm_input is None or rl_on_policy_target is not None:
+diff --git a/python/sglang/srt/model_executor/model_runner.py b/python/sglang/srt/model_executor/model_runner.py
+index fdf2e69bdd..dab3b5d8c1 100644
+--- a/python/sglang/srt/model_executor/model_runner.py
++++ b/python/sglang/srt/model_executor/model_runner.py
+@@ -21,6 +21,7 @@ import logging
+ import time
+ from dataclasses import dataclass
+ from typing import Optional, Union
++import os
+ 
+ import torch
+ import torch.distributed as dist
+@@ -215,6 +216,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
+ _is_cpu_arm64 = is_host_cpu_arm64()
+ 
+ if _is_npu:
++    import torch_npu
+     from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+ 
+     init_npu_backend()
+@@ -393,6 +395,32 @@ class ModelRunner:
+         # For weight updates
+         self.init_weight_updater()
+         self.init_weight_exporter()
++        from datetime import datetime
++        now_str = datetime.now().strftime('%m-%d-%H-%M')
++
++        profile_dir = f"./profile/{now_str}"
++
++        experimental_config = torch_npu.profiler._ExperimentalConfig(
++            profiler_level=torch_npu.profiler.ProfilerLevel.Level1,
++            export_type=torch_npu.profiler.ExportType.Db,  # 可选择torch_npu.profiler.ExportType.Text格式
++        )
++
++        self.profiler_npu = torch_npu.profiler.profile(
++            activities=[
++                torch_npu.profiler.ProfilerActivity.CPU,
++                torch_npu.profiler.ProfilerActivity.NPU
++            ],
++            with_modules=True,  # 采集调用栈
++            profile_memory=False,  # 采集内存
++            experimental_config=experimental_config,
++            schedule=torch_npu.profiler.schedule(wait=29, warmup=1, active=10, repeat=1),
++            on_trace_ready=torch_npu.profiler.tensorboard_trace_handler(
++                profile_dir,
++                analyse_flag=False  # 采集数据保存路径，是否在线解析
++            )
++        )
++        self.profiler_npu.start()
++
+ 
+     def _initialize_elastic_ep_joiner(self) -> None:
+         if not (
+@@ -1364,6 +1392,8 @@ class ModelRunner:
+         if self.server_args.elastic_ep_backend is not None:
+             self.maybe_join_ep_ranks()
+ 
++        self.profiler_npu.step()
++
+         return output
+ 
+     def _maybe_execute_deferred_mamba_cow_and_clear(
 diff --git a/python/sglang/srt/models/qwen2_moe.py b/python/sglang/srt/models/qwen2_moe.py
 index d2b744a680..0f59786a2b 100644
 --- a/python/sglang/srt/models/qwen2_moe.py
@@ -1624,18 +3188,120 @@ index d2b744a680..0f59786a2b 100644
  
          if staged and unstage_shared_expert_add() is None:
 diff --git a/python/sglang/srt/models/qwen3_5.py b/python/sglang/srt/models/qwen3_5.py
-index fcdcb92e06..57f1719c0d 100644
+index fcdcb92e06..add7080cca 100644
 --- a/python/sglang/srt/models/qwen3_5.py
 +++ b/python/sglang/srt/models/qwen3_5.py
-@@ -38,6 +38,7 @@ from sglang.srt.configs.qwen3_5 import (
+@@ -15,6 +15,7 @@
+ """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
+ 
+ import logging
++import os
+ from functools import lru_cache
+ from typing import Iterable, Optional, Set, Tuple, Union
+ 
+@@ -38,6 +39,16 @@ from sglang.srt.configs.qwen3_5 import (
  
  # Distributed
  from sglang.srt.distributed import get_pp_group
 +from sglang.srt.environ import envs
++
++# MoE 权重 L2 预取（v1.2，SGLANG_NPU_MOE_PREFETCH）：注册、本层 prepare_attn 后
++# 自目标发射 w13(+w2) 预取、step 末 drain。
++# 模块顶层不 import torch_npu，跨平台安全；未启用时为 no-op。
++from sglang.srt.hardware_backend.npu.moe_weight_prefetch import (
++    moe_prefetch_emit,
++    moe_prefetch_register_model,
++    moe_prefetch_step_drain,
++)
  from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
  from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
  from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
-@@ -210,6 +211,22 @@ if _is_npu:
+@@ -130,6 +141,20 @@ _gdn_use_alt_stream = _is_cuda or (
+ _qknorm_use_alt_stream = _is_cuda or (
+     get_bool_env_var("SGLANG_QK_NORM_ALT_STREAM", "False") and _hip_use_alt_stream
+ )
++# GDN_QKVZBA_PACK（code/gdn_qkvzba_pack_v1_2 包）：NPU 上把 GDN 层 in_proj_qkvz /
++# in_proj_ba 两个 MergedColumnParallelLinear 的权重沿 N（输出行）拼成单块
++# [N_pack, K]（N_pack = N_qkvz+N_ba 向上补零行到 16 倍数，见
++# _gdn_qkvzba_pack_materialize——补齐后打包输出的物理行距满足 op1
++# fused_qkvzba_conv1d v2.1 strided 输入的 32B 对齐契约，qkvz/ba 两段以行距视图
++# 直送 op1，零拷贝），一次 stock linear 取代两次 matmulV2。数学逐列等价——N 拼接
++# 不改变任何输出列的 K 归约内容（pad 列输出无人消费）。默认开；=0 回退两次 GEMM
++# 原链路。仅 NPU + 非量化 bf16/fp16 生效，其余形态由运行期守卫自动回退
++# （_gdn_qkvzba_packable）。
++_gdn_qkvzba_pack_env = get_bool_env_var("SGLANG_NPU_GDN_QKVZBA_PACK", "true")
++# 打包仅在小 M 启用：首轮实测（exp 见包 src/all_ut_result.txt）大 M 下宽 N
++# （如 3088，非 256 tile 整数倍）的 matmulV2 ragged tiling 惩罚超过省下的 ba
++# GEMM——M=1024 回退 +12~28%；M<=256（decode 全域）图模式稳定领先 3~5µs/层。
++_gdn_qkvzba_pack_max_m = int(os.getenv("SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M", "256"))
+ _is_amx_available = cpu_has_amx_support()
+ 
+ cached_get_processor = lru_cache(get_processor)
+@@ -206,10 +231,96 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
+     )
+ 
+ 
++def _gdn_qkvzba_packable(proj_qkvz, proj_ba) -> bool:
++    """GDN_QKVZBA_PACK 运行期守卫（任一不满足 → 回退两次 GEMM 原链路）。
++
++    只允许最普通的非量化 2D 权重：FP8 等量化形态的 scale 布局与 packed GEMM
++    的加性不兼容，直接排除（量化形态由 quant_method 类名判定）。
++    """
++    wq = proj_qkvz.weight
++    wb = proj_ba.weight
++    if wq.dim() != 2 or wb.dim() != 2 or wq.shape[1] != wb.shape[1]:
++        return False
++    if wq.dtype != wb.dtype or wq.dtype not in (torch.bfloat16, torch.float16):
++        return False
++    if proj_qkvz.bias is not None or proj_ba.bias is not None:
++        return False
++    for proj in (proj_qkvz, proj_ba):
++        qm = getattr(proj, "quant_method", None)
++        if qm is not None and qm.__class__.__name__ != "UnquantizedLinearMethod":
++            return False
++    return True
++
++
++def _gdn_qkvzba_pack_materialize(proj_qkvz, proj_ba) -> torch.Tensor:
++    """物化 [N_pack, K] 打包权重，并把两模块 weight.data 重绑为其行切片。
++
++    v1.2：N_pack = (N_qkvz+N_ba) 向上补零行到 16 倍数（如 TP8 的 1544→1552；
++    TP4 的 3088 本即 16 倍数、补 0 行）。打包 GEMM 输出的物理行距因此保持 16
++    倍数，满足 op1 fused_qkvzba_conv1d v2.1 strided 输入对 z 拷贝的 32B 对齐
++    契约（host TORCH_CHECK xRowStride%16==0），qkvz/ba 行距视图可直送 op1。
++    pad 行权重为零、pad 列输出无任何消费者。
++
++    重绑后两段参数的存储就是打包缓冲的行切片（packed[:n] 与 packed[n:n+m] 各自
++    连续，注意 ba 段切片**不含 pad 尾行**）：
++      - 权重 loader / RL 权重同步按 in-place narrow+copy_ 写入时（sglang 现状，
++        layers/linear.py 的 weight_loader 均为 param.data.copy_ 系），写入直接
++        落在打包缓冲上，天然同步、无需重物化；
++      - 若某路径整体替换 weight.data（指针漂移），调用方以 data_ptr 校验在
++        下一次 forward 自动重新物化。两种情形下打包缓冲都与模块权重一致。
++    返回打包缓冲（调用方缓存，并以 weight.data_ptr() == packed.data_ptr() 校验）。
++    """
++    wq = proj_qkvz.weight
++    wb = proj_ba.weight
++    n_qkvz = wq.shape[0]
++    n_ba = wb.shape[0]
++    n_pack = (n_qkvz + n_ba + 15) // 16 * 16
++    if n_pack == n_qkvz + n_ba:
++        packed = torch.cat([wq.detach(), wb.detach()], dim=0)
++    else:
++        packed = torch.cat(
++            [
++                wq.detach(),
++                wb.detach(),
++                wq.detach().new_zeros(n_pack - n_qkvz - n_ba, wq.shape[1]),
++            ],
++            dim=0,
++        )
++    wq.data = packed[:n_qkvz]
++    wb.data = packed[n_qkvz : n_qkvz + n_ba]
++    return packed
++
++
+ if _is_npu:
      from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
          split_qkvgate_gemma_rmsnorm_rope,
      )
@@ -1655,20 +3321,226 @@ index fcdcb92e06..57f1719c0d 100644
 +        fa_split_qkvgate_scatter_supported,
 +        fa_v4_scatter_context,
 +    )
++    # TP_FUSION: TP 线 AscendC 三算子接线（tp_ascendc_fusion 包；总开关
++    # SGLANG_NPU_TP_ASCENDC_FUSION 默认关）。部署假设同 v1：先将
++    # tp_ascendc_fusion_npu.py 落到 sglang/kernels/ops/ 再替换本文件。
++    from sglang.kernels.ops.tp_ascendc_fusion_npu import (
++        tp_fused_qkvzba_conv1d_shape_supported,
++        tp_norm_qkv_scatter_context,
++        tp_norm_qkv_scatter_shape_supported,
++        tp_sigmoid_mul_mm_runtime_ok,
++        tp_sigmoid_mul_mm_shape_supported,
++    )
  
  
  class Qwen3_5GatedDeltaNet(nn.Module):
-@@ -631,7 +648,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+@@ -298,6 +409,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+             )
+         )
+ 
++        # GDN_QKVZBA_PACK：打包开关与惰性物化缓存。打包在权重就绪后的首次
++        # forward 物化（_get_packed_qkvzba_weight），只改计算组织——两模块的
++        # 参数、名称、loader、checkpoint 映射全部不变，9B dense 与 35B MoE
++        # 共用本类、同享本开关。
++        self._qkvzba_pack_enabled = _is_npu and _gdn_qkvzba_pack_env
++        self._packed_qkvzba_weight: Optional[torch.Tensor] = None
++
+         # Conv1d weight loader setup
+         query_key_settings = (self.key_dim, 0, False)
+         value_settings = (self.value_dim, 0, False)
+@@ -316,8 +434,13 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+         )
+ 
+         # State parameters
++        # cast_elimination_v2（随本包携带，见 code/cast_elimination_v2）：dt_bias 与
++        # A_log 一样按 fp32 物化（下行 A_log 既有先例）。Triton gating/recurrent 核内
++        # 本就 .to(tl.float32)（无损加宽，值逐 bit 不变）；AscendC recurrent host 硬要
++        # fp32——此前 wrapper 每层 .float() 真 cast（图内 1 cast/层），本改动后变 no-op。
++        # 加载与 RL 权重同步均 copy_ 系（隐式转换），与 A_log 生产已验证路径相同。
+         self.dt_bias = nn.Parameter(
+-            torch.ones(self.num_v_heads // self.attn_tp_size),
++            torch.ones(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
+         )
+         self.A_log = nn.Parameter(
+             torch.empty(self.num_v_heads // self.attn_tp_size, dtype=torch.float32),
+@@ -370,6 +493,17 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+             prefix=add_prefix("out_proj", prefix),
+         )
+ 
++        # TP_FUSION 候选1：fused_qkvzba_conv1d（split+causal_conv1d 单 kernel）的
++        # init 期形状守卫烘定（头数传 TP 切分后 per-rank 值，与算子语义一致）；
++        # 未命中/总开关关闭 → forward 走原 split+causal_conv1d 链路（逐字保留在下方）
++        self._tp_fused_qkvzba_ok = _is_npu and tp_fused_qkvzba_conv1d_shape_supported(
++            triton.cdiv(self.num_k_heads, self.attn_tp_size),
++            triton.cdiv(self.num_v_heads, self.attn_tp_size),
++            self.head_k_dim,
++            self.head_v_dim,
++            self.conv_kernel_size,
++        )
++
+     @staticmethod
+     def _override_weight_loader(param, loader):
+         """Robustly override loader for:
+@@ -538,6 +672,23 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+ 
+         return query, key, value, z, b, a
+ 
++    def _get_packed_qkvzba_weight(self) -> torch.Tensor:
++        """GDN_QKVZBA_PACK：返回打包权重 [N_qkvz+N_ba, K]。
++
++        惰性物化（权重加载完成后首次 forward 触发）；此后每次 forward 以
++        data_ptr 校验——in-place 写入（loader / RL 权重同步）下指针不变、
++        缓冲天然同步，整体替换 .data 时指针漂移、自动重新物化。
++        """
++        packed = self._packed_qkvzba_weight
++        if (
++            packed is not None
++            and self.in_proj_qkvz.weight.data_ptr() == packed.data_ptr()
++        ):
++            return packed
++        packed = _gdn_qkvzba_pack_materialize(self.in_proj_qkvz, self.in_proj_ba)
++        self._packed_qkvzba_weight = packed
++        return packed
++
+     def _forward_input_proj(self, hidden_states: torch.Tensor):
+         # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
+         # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
+@@ -579,8 +730,34 @@ class Qwen3_5GatedDeltaNet(nn.Module):
+                 )
+             )
+         else:
+-            projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
+-            projected_states_ba, _ = self.in_proj_ba(hidden_states)
++            if (
++                self._qkvzba_pack_enabled
++                and seq_len <= _gdn_qkvzba_pack_max_m
++                and _gdn_qkvzba_packable(self.in_proj_qkvz, self.in_proj_ba)
++            ):
++                # GDN_QKVZBA_PACK（v1.2）：单次打包 GEMM（stock linear → matmulV2），
++                # 输出 [M, N_pack]（N_pack 补到 16 倍数）按行切片成两段视图
++                # （行距 = N_pack，列内连续）。仅小 M 打包（M 门控原因见模块顶部
++                # _gdn_qkvzba_pack_max_m 注释；graph capture 按固定 bs 烘定
++                # 本分支，per-graph 一致）。下游三条消费路径：
++                #   1) 方案A Triton split（sgl_kernel_npu fla/utils.py，按 stride(0)
++                #      取行距）直接读视图，零拷贝；
++                #   2) TP_FUSION 候选1 fused_qkvzba_conv1d v2.1 起原生支持行距视图
++                #      输入（host 契约 = 列内连续 + 行距 16 倍数，打包 N 已补齐）——
++                #      直读零拷贝（v1.1 的两次 .contiguous() 已删除）；
++                #   3) fix_query_key_value_ordering 回退路径本就 split+reshape
++                #      拷贝，视图不引入额外拷贝。
++                # 注意 ba 段切片必须显式排除 pad 尾列（N_pack 可能 > N_qkvz+N_ba）。
++                projected_states_qkvzba = nn.functional.linear(
++                    hidden_states, self._get_packed_qkvzba_weight()
++                )
++                n_qkvz = self.in_proj_qkvz.weight.shape[0]
++                n_ba = self.in_proj_ba.weight.shape[0]
++                projected_states_qkvz = projected_states_qkvzba[:, :n_qkvz]
++                projected_states_ba = projected_states_qkvzba[:, n_qkvz : n_qkvz + n_ba]
++            else:
++                projected_states_qkvz, _ = self.in_proj_qkvz(hidden_states)
++                projected_states_ba, _ = self.in_proj_ba(hidden_states)
+         return projected_states_qkvz, projected_states_ba
+ 
+     def _forward_input_proj_fused_quant_amd(self, hidden_states):
+@@ -631,39 +808,67 @@ class Qwen3_5GatedDeltaNet(nn.Module):
              hidden_states
          )
  
 -        if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_npu:
-+        # v1 变更（方案A）：NPU 也走融合 split kernel（上方 import 已按平台分派）
-+        if self.num_v_heads // self.num_k_heads in [1, 2, 4]:
-             if _is_cpu:
-                 num_k_heads_tp = self.num_k_heads // self.attn_tp_size
-                 num_v_heads_tp = self.num_v_heads // self.attn_tp_size
-@@ -718,7 +736,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+-            if _is_cpu:
+-                num_k_heads_tp = self.num_k_heads // self.attn_tp_size
+-                num_v_heads_tp = self.num_v_heads // self.attn_tp_size
+-            else:
+-                num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
+-                num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+-            mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
+-                projected_states_qkvz,
+-                projected_states_ba,
+-                num_k_heads_tp,
+-                num_v_heads_tp,
+-                self.head_k_dim,
+-                self.head_v_dim,
+-            )
+-        else:
+-            query, key, value, z, b, a = self.fix_query_key_value_ordering(
+-                projected_states_qkvz, projected_states_ba
++        # TP_FUSION 候选1：decode 且 init 守卫命中时，原始 qkvz/ba 投影以 tuple 直送
++        # GDN backend——split+causal_conv1d 在 torch.ops.npu.fused_qkvzba_conv1d 单
++        # kernel 内完成（conv_states 原地更新语义不变），z 随返回值回流（供下方
++        # self.norm(core_attn_out, z) 使用）。约定：tuple 进 → (core_attn_out, z)
++        # 出（配套件 ascend_gdn_backend.py 的 forward_decode tuple 分支；backend
++        # 运行期判定不通过时内部回退本地 split+stock conv，仍以 tuple 返回）。
++        # 图 capture 时该 Python 分支烘进图（与 A1b 同款）。
++        core_attn_out = None
++        z = None
++        if self._tp_fused_qkvzba_ok and forward_batch.forward_mode.is_decode():
++            # GDN_QKVZBA_PACK v1.2：打包路径产出的行距视图**直送** op1——
++            # fused_qkvzba_conv1d v2.1 host 契约已放宽为「列内连续 + 行距 16 倍数」
++            # （打包 N 补到 16 倍数即满足），v1.1 在此处的两次 .contiguous() 拷贝
++            # （35B/TP8 实测合计 ~9µs/层，吞掉打包收益）已删除。
++            # 部署耦合：本文件须与本包的 tp_ascendc_fusion_npu.py + csrc host 同批
++            # 部署（新守卫放行视图 + 旧 host 仍 TORCH_CHECK 连续 的组合会在 capture
++            # 期显式报错而非静默回退）；若运行期守卫不通过（如旧守卫 python 在跑），
++            # backend 回退方案A Triton split（stride(0) 版零拷贝消费视图）+ stock
++            # conv，正确性不受影响。
++            core_attn_out, z = self.attn(
++                forward_batch,
++                mixed_qkv=(projected_states_qkvz, projected_states_ba),
++                a=None,
++                b=None,
+             )
+-            b = b.contiguous()
+-            a = a.contiguous()
+ 
+-            query, key, value = map(
+-                lambda x: x.reshape(x.shape[0], -1), (query, key, value)
+-            )
+-            mixed_qkv = torch.cat((query, key, value), dim=-1)
++        if core_attn_out is None:
++            # v1 变更（方案A）：NPU 也走融合 split kernel（上方 import 已按平台分派）
++            if self.num_v_heads // self.num_k_heads in [1, 2, 4]:
++                if _is_cpu:
++                    num_k_heads_tp = self.num_k_heads // self.attn_tp_size
++                    num_v_heads_tp = self.num_v_heads // self.attn_tp_size
++                else:
++                    num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
++                    num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
++                mixed_qkv, z, b, a = fused_qkvzba_split_reshape_cat_contiguous(
++                    projected_states_qkvz,
++                    projected_states_ba,
++                    num_k_heads_tp,
++                    num_v_heads_tp,
++                    self.head_k_dim,
++                    self.head_v_dim,
++                )
++            else:
++                query, key, value, z, b, a = self.fix_query_key_value_ordering(
++                    projected_states_qkvz, projected_states_ba
++                )
++                b = b.contiguous()
++                a = a.contiguous()
+ 
+-        core_attn_out = self.attn(
+-            forward_batch,
+-            mixed_qkv=mixed_qkv,
+-            a=a,
+-            b=b,
+-        )
++                query, key, value = map(
++                    lambda x: x.reshape(x.shape[0], -1), (query, key, value)
++                )
++                mixed_qkv = torch.cat((query, key, value), dim=-1)
++
++            core_attn_out = self.attn(
++                forward_batch,
++                mixed_qkv=mixed_qkv,
++                a=a,
++                b=b,
++            )
+ 
+         z_shape_og = z.shape
+         # reshape input data into 2D tensor
+@@ -718,7 +923,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                  quant_config=quant_config,
                  alt_stream=(
                      alt_stream
@@ -1681,7 +3553,20 @@ index fcdcb92e06..57f1719c0d 100644
                      else None
                  ),
                  prefix=add_prefix("mlp", prefix.replace(".linear_attn", "")),
-@@ -943,7 +965,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -790,6 +999,12 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
+             )
+         )
+ 
++        # MoE 权重 L2 预取（v1.2）：自目标发射——本层 prepare_attn 之后、
++        # attention 之前。EP 的层间通信（RS+AG）在 prepare_attn 内完成、
++        # TP 的层尾 AR 在上一层 postprocess_layer 内完成，此点在两条线下
++        # 都位于全部层间通信之后。仅 GDN 层；主流不 wait，step 末统一 drain。
++        moe_prefetch_emit(self, hidden_states)
++
+         if not forward_batch.forward_mode.is_idle():
+             hidden_states = self.linear_attn(
+                 hidden_states,
+@@ -943,7 +1158,11 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                  quant_config=quant_config,
                  alt_stream=(
                      alt_stream
@@ -1694,7 +3579,7 @@ index fcdcb92e06..57f1719c0d 100644
                      else None
                  ),
                  prefix=add_prefix("mlp", prefix.replace(".self_attn", "")),
-@@ -989,6 +1015,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -989,6 +1208,26 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
  
          self.alt_stream = alt_stream
  
@@ -1708,10 +3593,20 @@ index fcdcb92e06..57f1719c0d 100644
 +            self.attn_output_gate,
 +        )
 +
++        # TP_FUSION 候选2/候选3：norm+qkv_proj+KV scatter 三合一与
++        # sigmoid_mul+o_proj 融合的 init 期形状守卫烘定（未命中/总开关关闭 →
++        # 运行时逐字走 v1 原链路）
++        self._tp_fa_norm_qkv_scatter_ok = _is_npu and tp_norm_qkv_scatter_shape_supported(
++            self
++        )
++        self._tp_sigmoid_mul_mm_ok = _is_npu and tp_sigmoid_mul_mm_shape_supported(
++            self.o_proj
++        )
++
      def _apply_qk_norm(
          self, q: torch.Tensor, k: torch.Tensor
      ) -> Tuple[torch.Tensor, torch.Tensor]:
-@@ -1113,6 +1149,30 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -1113,6 +1352,30 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
          if self.attn.layer_id == (self.config.full_attention_interval - 1):
              self.rotary_emb.get_cos_sin_with_position(positions)
  
@@ -1742,7 +3637,7 @@ index fcdcb92e06..57f1719c0d 100644
          q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
              qkv,
              self.rotary_emb.position_sin,
-@@ -1160,14 +1220,22 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+@@ -1160,18 +1423,105 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                  forward_batch=forward_batch,
              )
  
@@ -1758,6 +3653,16 @@ index fcdcb92e06..57f1719c0d 100644
              else:
                  gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
 -                attn_output.mul_(torch.sigmoid(gate_val))
++                # TP_FUSION 候选3：sigmoid_mul + o_proj GEMM 单 kernel
++                # （torch.ops.npu.fused_sigmoid_mul_mm；输出 [M,2048] partial sum，
++                # 无 bias 无 all-reduce，与 o_proj(reduce_results=False) 的返回语义
++                # 一致，故直接作为本层输出返回）；守卫未命中 → 回退下方 A2/stock 链
++                if self._tp_sigmoid_mul_mm_ok and tp_sigmoid_mul_mm_runtime_ok(
++                    attn_output, gate_val
++                ):
++                    return torch.ops.npu.fused_sigmoid_mul_mm(
++                        attn_output, gate_val, self.o_proj.weight
++                    )
 +                # v1 变更（full_attention A2）：sigmoid+mul 融合单 kernel，与 stock
 +                # 双 op 舍入路径逐位一致；不满足守卫（非 bf16/非连续）回退 stock
 +                if fa_sigmoid_mul_supported(attn_output, gate_val):
@@ -1767,7 +3672,138 @@ index fcdcb92e06..57f1719c0d 100644
  
          output, _ = self.o_proj(attn_output)
          return output
-@@ -1340,7 +1408,11 @@ class Qwen3_5ForCausalLM(nn.Module):
+ 
++    def _self_attention_tp_fused(
++        self,
++        positions: torch.Tensor,
++        hidden_states: torch.Tensor,
++        residual: torch.Tensor,
++        forward_batch: ForwardBatch,
++        tp_ctx,
++    ) -> Tuple[torch.Tensor, torch.Tensor]:
++        """TP_FUSION 候选2 的 FA decode 主干（prepare 的 input_layernorm 并入 kernel）。
++
++        hidden_states/residual 为 prepare 前的原始张量（未做 add+norm）；返回
++        (o_proj partial 输出, kernel 产出的新 residual add_out)，供 forward 直接进
++        prepare_mlp——与 stock 的 (attn 输出, A3a add_out) 语义逐点一致。
++        调用前须过 tp_norm_qkv_scatter_context（tp_ctx 非 None）。
++        """
++        # 与 forward_prepare_npu 相同：首个全注意力层先刷新 sin/cos 缓存
++        if self.attn.layer_id == (self.config.full_attention_interval - 1):
++            self.rotary_emb.get_cos_sin_with_position(positions)
++
++        rope_dim = int(self.head_dim * self.partial_rotary_factor)
++        # kernel 要求 [M,64] fp32 连续；position_sin/cos 现形 [M,1,1,64]（view 平）。
++        # NPU 默认 rope cache 为 bf16（SGLANG_ROPE_CACHE_FP32 未开）→ widening cast
++        # 到 fp32（bf16→fp32 精确，取值与 A1b kernel 内 load 后 .to(fp32) 逐位一致）
++        sin = self.rotary_emb.position_sin.view(-1, rope_dim)
++        cos = self.rotary_emb.position_cos.view(-1, rope_dim)
++        if sin.dtype != torch.float32:
++            sin = sin.float()
++            cos = cos.float()
++
++        kbuf, vbuf, loc = tp_ctx
++        add_out, q, gate = torch.ops.npu.fused_norm_qkv_proj_scatter(
++            hidden_states,
++            residual,
++            self.input_layernorm.weight,
++            self.qkv_proj.weight,
++            self.q_norm.weight,
++            self.k_norm.weight,
++            sin,
++            cos,
++            loc,
++            kbuf,
++            vbuf,
++            self.num_heads,
++            self.num_kv_heads,
++            self.head_dim,
++            rope_dim,
++            self.input_layernorm.variance_epsilon,
++            self.q_norm.variance_epsilon,
++        )
++        # k/v 已由 kernel 按 out_cache_loc 直写 cache（同 A1b 约定：save_kv_cache=False，
++        # backend 侧跳过 set_kv_buffer）
++        attn_output = self.attn(q, None, None, forward_batch, save_kv_cache=False)
++
++        # 候选3（与 self_attention 尾部同一套守卫）：命中则 A2+o_proj 一并融合；
++        # 未命中回退 A2/stock 尾部（gate 为 kernel 直出的 [M,512] 2D 连续张量）
++        if self._tp_sigmoid_mul_mm_ok and tp_sigmoid_mul_mm_runtime_ok(
++            attn_output, gate
++        ):
++            output = torch.ops.npu.fused_sigmoid_mul_mm(
++                attn_output, gate, self.o_proj.weight
++            )
++        elif fa_sigmoid_mul_supported(attn_output, gate):
++            attn_output = fa_sigmoid_mul(attn_output, gate)
++            output, _ = self.o_proj(attn_output)
++        else:
++            attn_output.mul_(torch.sigmoid(gate))
++            output, _ = self.o_proj(attn_output)
++        return output, add_out
++
+     def forward(
+         self,
+         positions: torch.Tensor,
+@@ -1181,21 +1531,49 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
+         captured_last_layer_outputs: Optional[list[torch.Tensor]] = None,
+         **kwargs,
+     ):
+-        hidden_states, residual = (
+-            self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
++        # TP_FUSION 候选2：decode 且运行期守卫全命中时，跳过 prepare 内的
++        # input_layernorm——add+gemma rmsnorm 已由 fused_norm_qkv_proj_scatter 并入
++        # kernel，原始 hidden_states/residual 直进 kernel，add_out 作为新 residual
++        # 进 prepare_mlp。本配置（TP、无 dp-attention、非首层、无 AR fusion pending）
++        # 下 prepare_attn 除 norm 外恒为空操作（input_scattered=False、
++        # _communicate_simple_fn=trivial、无 qkv_latent），故跳过无遗漏；
++        # 任一前提破坏 → tp_ctx=None，走下方 v1 原链路（逐字保留）。
++        tp_ctx = (
++            tp_norm_qkv_scatter_context(
++                self,
+                 hidden_states,
+                 residual,
+                 forward_batch,
+-                captured_last_layer_outputs=captured_last_layer_outputs,
++                captured_last_layer_outputs,
+             )
++            if (_is_npu and self._tp_fa_norm_qkv_scatter_ok)
++            else None
+         )
++        if tp_ctx is None:
++            hidden_states, residual = (
++                self.layer_communicator.prepare_attn_and_capture_last_layer_outputs(
++                    hidden_states,
++                    residual,
++                    forward_batch,
++                    captured_last_layer_outputs=captured_last_layer_outputs,
++                )
++            )
+ 
+-        if not forward_batch.forward_mode.is_idle():
+-            hidden_states = self.self_attention(
+-                positions=positions,
+-                hidden_states=hidden_states,
+-                forward_batch=forward_batch,
++        # MoE 权重 L2 预取（v1.2）：保持在本层全部层间通信之后、attention 之前。
++        # TP 候选2命中时 prepare_attn 被同语义融合路径替代，层间 AR 已由上一层完成。
++        moe_prefetch_emit(self, hidden_states)
++
++        if tp_ctx is not None:
++            hidden_states, residual = self._self_attention_tp_fused(
++                positions, hidden_states, residual, forward_batch, tp_ctx
+             )
++        else:
++            if not forward_batch.forward_mode.is_idle():
++                hidden_states = self.self_attention(
++                    positions=positions,
++                    hidden_states=hidden_states,
++                    forward_batch=forward_batch,
++                )
+ 
+         # Fully Connected
+         hidden_states, residual = self.layer_communicator.prepare_mlp(
+@@ -1340,7 +1718,11 @@ class Qwen3_5ForCausalLM(nn.Module):
          if _is_hip:
              self._maybe_autodisable_shared_experts_fusion(config, quant_config)
  
@@ -1780,34 +3816,70 @@ index fcdcb92e06..57f1719c0d 100644
  
          # Embedding layer
          if self.pp_group.is_first_rank:
-diff --git a/python/sglang/srt/utils/hf_transformers/processor.py b/python/sglang/srt/utils/hf_transformers/processor.py
-index 38dfa7f0f2..fb2b888d68 100644
---- a/python/sglang/srt/utils/hf_transformers/processor.py
-+++ b/python/sglang/srt/utils/hf_transformers/processor.py
-@@ -146,6 +146,9 @@ def get_processor(
-     model_name: Optional[str] = None,
-     **kwargs,
- ):
-+    # print(f"[tmp log] get_processor {tokenizer_backend=}")
-+    # import traceback
-+    # traceback.print_stack()
-     if tokenizer_backend == "fastokens":
-         from .tokenizer import _ensure_fastokens_patched
+@@ -1386,6 +1768,13 @@ class Qwen3_5ForCausalLM(nn.Module):
  
-diff --git a/python/sglang/srt/utils/hf_transformers/tokenizer.py b/python/sglang/srt/utils/hf_transformers/tokenizer.py
-index def8d25814..7ae32894b0 100644
---- a/python/sglang/srt/utils/hf_transformers/tokenizer.py
-+++ b/python/sglang/srt/utils/hf_transformers/tokenizer.py
-@@ -473,6 +473,10 @@ def get_tokenizer(
+         self.layers_to_capture = []
  
-         return TiktokenTokenizer(tokenizer_name)
- 
-+    # print(f"[tmp log] get_tokenizer {tokenizer_backend=}")
-+    # import traceback
-+    # traceback.print_stack()
++        # MoE 权重 L2 预取（v1.2）：注册本模型各层 MoE 权重（layer_id → w13/w2
++        # 及 GDN 目标层标记 + 层对象发射标记），并在 capture 外创建专用预取流；
++        # is_nextn 的 MTP draft 模型不注册（其层无发射标记，draft capture
++        # 内不会误发射）。
++        if not is_nextn:
++            moe_prefetch_register_model(self)
 +
-     if tokenizer_backend == "fastokens":
-         _ensure_fastokens_patched()
+     def get_input_embeddings(self):
+         return self.embed_tokens
+ 
+@@ -1454,6 +1843,10 @@ class Qwen3_5ForCausalLM(nn.Module):
+                     input_deepstack_embeds[:, sep : sep + self.hidden_size]
+                 )
+ 
++        # MoE 权重 L2 预取（v1.2）：step 末 drain——主流 join 预取流
++        # （capture 合法性 + 防跨 step 积压）；未启用/本 pass 未发射时为 no-op。
++        moe_prefetch_step_drain()
++
+         # Return intermediate tensors for pipeline parallelism
+         if not self.pp_group.is_last_rank:
+             return PPProxyTensors(
+diff --git a/python/sglang/srt/sampling/sampling_batch_info.py b/python/sglang/srt/sampling/sampling_batch_info.py
+index 0d8d8c59bb..c2925d04e6 100644
+--- a/python/sglang/srt/sampling/sampling_batch_info.py
++++ b/python/sglang/srt/sampling/sampling_batch_info.py
+@@ -44,6 +44,13 @@ class SamplingBatchInfo:
+ 
+     # Masking tensors for grammar-guided structured outputs
+     vocab_size: int
++    # post_sample v3.2：全 batch temperature == 1.0 标记（host 侧，from_schedule_batch
++    # 由请求 host list 算出；merge 取与、filter 取子集天然保持）。True 时
++    # logits.div_(temperatures) 是 IEEE 逐位恒等（x/1.0 == x），sampler 跳过该
++    # RealDiv（decode 每 step 省一次 [B,V] 全 vocab 除法，实测 ~27µs@生产形态）。
++    # 默认 False（保守：不跳过），与旧版行为逐字一致。注意必须放在无默认字段
++    # （vocab_size）之后，否则 dataclass 报 non-default follows default。
++    temperatures_all_one: bool = False
+     grammars: Optional[List] = None
+     rids_int: Optional[torch.Tensor] = None
+     bootstrap_room_ids_int: Optional[torch.Tensor] = None
+@@ -203,6 +210,11 @@ class SamplingBatchInfo:
+             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
+             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
+             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
++            # post_sample v3.2：host list 直算（float == 1.0 精确比较，
++            # 生产 --rollout-temperature 1 全 batch 命中）
++            temperatures_all_one=all(
++                r.sampling_params.temperature == 1.0 for r in reqs
++            ),
+             vocab_size=vocab_size,
+             penalizer_orchestrator=penalizer_orchestrator,
+             has_custom_logit_processor=has_custom_logit_processor,
+@@ -444,6 +456,9 @@ class SamplingBatchInfo:
+         self.need_top_p_sampling |= other.need_top_p_sampling
+         self.need_top_k_sampling |= other.need_top_k_sampling
+         self.need_min_p_sampling |= other.need_min_p_sampling
++        # post_sample v3.2：merge 取与（任一侧含非 1.0 温度即不跳过）；
++        # filter 取子集天然保持，无需维护。
++        self.temperatures_all_one &= other.temperatures_all_one
+ 
+         self.adjusted_merge_batch(other)
  
 diff --git a/python/sglang/srt/utils/torch_memory_saver_adapter.py b/python/sglang/srt/utils/torch_memory_saver_adapter.py
 index ad98e59283..dd4384c316 100644

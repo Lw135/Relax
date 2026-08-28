@@ -7,6 +7,9 @@
 # Usage:
 #   NUM_GPUS=4 bash scripts/training/text/run-qwen3-4B-4xgpu-async.sh
 
+# sleep $((100 * 60))
+# wall "131 132 19:00-22:00双机占用"
+
 set -ex
 set -o pipefail
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
@@ -20,7 +23,7 @@ export HCCL_CONNECT_TIMEOUT=1200
 export RAY_DEDUP_LOGS=0
 export PYTHONBUFFERED=1
 
-now=$(date "+%Y-%m-%d-%H:%M:%S")
+now=$(date "+%Y-%m-%d-%H-%M-%S")
 echo "当前时间: $now"
 export ASCEND_COREDUMP_SIGNAL=none
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
@@ -48,6 +51,19 @@ export STREAMS_PER_DEVICE=32
 export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
 export SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES=30
 export TASK_QUEUE_ENABLE=1
+export SGLANG_NPU_GDN_UPDATE_FUSED=1
+
+export SGLANG_NPU_TP_ASCENDC_FUSION=1
+export SGLANG_NPU_GDN_RECURRENT_ASCENDC=1
+
+export SGLANG_NPU_EXP_RACE_TRITON=1
+export SGLANG_NPU_GDN_QKVZBA_PACK=1
+export SGLANG_NPU_GDN_QKVZBA_PACK_MAX_M=256
+export SGLANG_NPU_MOE_PREFETCH=0
+
+# export HCCL_BUFFSIZE=1024
+# export HCCL_INTRA_PCIE_ENABLE=1
+# export HCCL_INTRA_ROCE_ENABLE=0
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)"
 # Auto-source local environment when not launched via an external entrypoint
@@ -203,7 +219,7 @@ if [ "$MASTER_ADDR" = "$CURRENT_IP" ]; then
       "${PERF_ARGS[@]}" \
       "${EVAL_ARGS[@]}" \
       "${SGLANG_ARGS[@]}" \
-      "${MISC_ARGS[@]}" 2>&1 | tee log/qwen35-35B-gpu16-sync-thd-nnode2.log
+      "${MISC_ARGS[@]}" 2>&1 | tee log/multi_$now.log
 else
    echo "wiil not get here"
 fi
